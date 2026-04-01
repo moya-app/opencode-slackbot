@@ -40,6 +40,8 @@ export type SessionState = {
   textPartStates: Map<string, string>
   textPartToMessageID: Map<string, string>
   messagePartOrder: Map<string, string[]>
+  /** Part IDs belonging to reasoning parts — excluded from the final posted message. */
+  reasoningPartIDs: Set<string>
   messageFinishByID: Map<string, string>
   publishedMessageIDs: Set<string>
   thinkingMessageIDs: Set<string>

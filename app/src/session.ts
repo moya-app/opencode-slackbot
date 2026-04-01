@@ -46,6 +46,7 @@ export class SessionStore {
       textPartStates: new Map(),
       textPartToMessageID: new Map(),
       messagePartOrder: new Map(),
+      reasoningPartIDs: new Set(),
       messageFinishByID: new Map(),
       publishedMessageIDs: new Set(),
       thinkingMessageIDs: new Set(),
@@ -109,6 +110,7 @@ export class SessionStore {
     session.textPartStates = new Map()
     session.textPartToMessageID = new Map()
     session.messagePartOrder = new Map()
+    session.reasoningPartIDs = new Set()
     session.messageFinishByID = new Map()
     session.publishedMessageIDs = new Set()
     session.thinkingMessageIDs = new Set()

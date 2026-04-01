@@ -10,12 +10,22 @@ export function buildToolChunk(part: ToolPart, session: SessionState): TaskUpdat
   const taskId = part.id
   const { state } = part
 
+  // Build human-readable titles from tool inputs — clearer than the raw
+  // `state.title` the SDK sets (which is often just the regex pattern or path).
   let title: string = part.tool
-  if ("title" in state && state.title) title = state.title
-
   if (part.tool === "read" && state.input.filePath) {
-    const rel_path = (state.input.filePath as string).replace(DATA_DIR + "/", "")
-    title = `Reading from ${rel_path}`
+    const rel_path = (state.input.filePath as string).replace(DATA_DIR, "")
+    title = `Reading ${rel_path}`
+  } else if (part.tool === "grep" && state.input.pattern) {
+    const pattern = state.input.pattern as string
+    const short = pattern.length > 40 ? pattern.slice(0, 40) + "…" : pattern
+    title = `Searching for "${short}"`
+  } else if (part.tool === "glob" && state.input.pattern) {
+    const pattern = state.input.pattern as string
+    const short = pattern.length > 40 ? pattern.slice(0, 40) + "…" : pattern
+    title = `Finding ${short}`
+  } else if ("title" in state && state.title) {
+    title = state.title
   }
 
   if (state.status === "running") {

@@ -78,8 +78,11 @@ export async function startEventLoop(
   }
 
   for await (const event of events.stream) {
+    //console.log(event)
     const eventAny = event as any
 
+    // On idle the task has completed so handle any message flushes, complete all tasks, give final message and cost
+    // summary to user
     if (event.type === "session.idle") {
       const match = store.findBySessionId(event.properties.sessionID)
       if (!match) continue
@@ -152,13 +155,12 @@ export async function startEventLoop(
       const [key, session] = match
 
       if (info.role !== "assistant") {
-        // Bug 2 fix: clean up any text parts registered for non-assistant messages
+        // Clean up any text parts registered for non-assistant messages
         // so they don't appear in fallback publishing
         clearTextPartsForMessage(session, info.id)
         continue
       }
 
-      // Bug 2 fix: track assistant message IDs
       session.assistantMessageIDs.add(info.id)
 
       const nextUsage = parseMessageUsage(info)
@@ -173,12 +175,11 @@ export async function startEventLoop(
       if (typeof info.finish === "string") {
         session.messageFinishByID.set(info.id, info.finish)
 
-        // Bug 1 fix: when a message finishes (any finish value), immediately
-        // complete its thinking task so it stops flashing. Don't wait for session.idle.
+        // when a message finishes (any finish value), immediately complete its thinking task so it stops flashing.
+        // Don't wait for session.idle.
         if (session.thinkingMessageIDs.has(info.id) && session.streamer) {
           const pendingEntry = pending.get(key)
           if (pendingEntry) {
-            // Remove any pending thinking update for this message
             pendingEntry.thinkingUpdates.delete(info.id)
           }
           session.thinkingMessageIDs.delete(info.id)
@@ -230,6 +231,24 @@ export async function startEventLoop(
       if (typeof messageID !== "string" || messageID.length === 0) continue
       if (typeof delta !== "string" || delta.length === 0) continue
 
+      // Reasoning-part deltas feed the thinking stream task but must not be
+      // registered as publishable text — they are thinking traces, not the
+      // final answer. (gpt-5.4 and other reasoning models emit reasoning parts
+      // before the actual text part, causing the full thought chain to appear
+      // in the posted Slack message if we don't exclude them here.)
+      if (session.reasoningPartIDs.has(partId)) {
+        const entry = getOrCreatePending(key, session)
+        if (!session.thinkingMessageIDs.has(messageID) && !session.messageFinishByID.has(messageID)) {
+          session.thinkingMessageIDs.add(messageID)
+        }
+        if (session.thinkingMessageIDs.has(messageID)) {
+          const prevDelta = entry.thinkingUpdates.get(messageID) || ""
+          entry.thinkingUpdates.set(messageID, prevDelta + delta)
+        }
+        scheduleFlush()
+        continue
+      }
+
       registerTextPart(session, messageID, partId)
 
       const previous = session.textPartStates.get(partId) || ""
@@ -273,6 +292,10 @@ export async function startEventLoop(
       if (part.type === "tool") {
         const chunk = buildToolChunk(part, session)
         if (chunk) entry.chunks.push(chunk)
+      } else if (part.type === "reasoning") {
+        // Mark this part ID so its text deltas are routed to the thinking stream
+        // only — not accumulated into the publishable message text.
+        session.reasoningPartIDs.add(part.id)
       } else if (part.type === "text") {
         registerTextPart(session, part.messageID, part.id)
         const previous = session.textPartStates.get(part.id) || ""
