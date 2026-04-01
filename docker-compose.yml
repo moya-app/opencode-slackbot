@@ -5,6 +5,8 @@ services:
     volumes:
       - ./config/opencode.jsonc:/root/.config/opencode/opencode.jsonc:ro
       - ./data:/app/data:ro
-      - ./sessions:/root/.local/share/opencode
+      - session_data:/root/.local/share/opencode
     init: true
-    restart: unless-stopped
+
+volumes:
+  session_data:
