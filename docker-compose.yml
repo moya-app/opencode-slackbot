@@ -1,0 +1,10 @@
+services:
+  opencode:
+    image: ghcr.io/moya-app/opencode-slackbot:latest
+    env_file: app.env
+    volumes:
+      - ./config/opencode.jsonc:/root/.config/opencode/opencode.jsonc:ro
+      - ./data:/app/data
+      - ./sessions:/root/.local/share/opencode
+    init: true
+    restart: unless-stopped

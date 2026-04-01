@@ -1,0 +1,4 @@
+services:
+  opencode:
+    build: .
+    image: opencode-slackbot:dev

@@ -1,0 +1,5 @@
+# Local config that should not be committed
+/config/opencode.jsonc
+/data
+/sessions
+/app.env

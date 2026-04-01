@@ -1,0 +1,60 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  //"model": "anthropic/claude-opus-4-6",
+  "model": "anthropic/claude-sonnet-4-6",
+  "mcp": {
+    "mcp-clickhouse": {
+      "type": "local",
+      "command": [
+        "/root/.local/bin/uv",
+        "run",
+        "--with",
+        "mcp-clickhouse",
+        "--python",
+        "3.10",
+        "mcp-clickhouse"
+      ],
+      "environment": {
+        "CLICKHOUSE_HOST": "{env:CLICKHOUSE_HOST}",
+        "CLICKHOUSE_PORT": "{env:CLICKHOUSE_PORT}",
+        "CLICKHOUSE_USER": "{env:CLICKHOUSE_USER}",
+        "CLICKHOUSE_PASSWORD": "{env:CLICKHOUSE_PASSWORD}",
+        "CLICKHOUSE_SECURE": "false",
+        "CLICKHOUSE_VERIFY": "false",
+        "CLICKHOUSE_CONNECT_TIMEOUT": "30",
+        "CLICKHOUSE_SEND_RECEIVE_TIMEOUT": "30"
+      }
+    }
+  },
+  "permission": {
+    // Deny everything write-related. TODO: "*": "deny" seems to block MCP configs so annoyingly we can't just do that?
+    //"*": "deny",
+    "bash": "deny",
+    "edit": "deny",
+    "write": "deny",
+    "apply_patch": "deny",
+    "question": "deny",
+    "task": "deny",
+
+    // Basic file permissions
+    "read": "allow",
+    "glob": "allow",
+    "grep": "allow",
+    "list": "allow",
+
+    // Allow web fetching
+    //"websearch": "allow",
+    "webfetch": "allow",
+
+    // Allow subagents
+    //"task": "allow",
+    "skill": "allow",
+
+    /*
+    "mcp-clickhouse": "allow",
+    "list_databases": "allow",
+    "list_tables": "allow",
+    "run_select_query": "allow",
+  */
+  }
+}
