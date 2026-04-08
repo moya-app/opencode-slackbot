@@ -55,14 +55,17 @@ The connector uses **Socket Mode** which allows real-time messaging without need
 |-------|---------|
 | `chat:write` | Send messages |
 | `files:write` | Upload images |
-| `channels:history` | Read messages in public channels |
+| `channels:history` | Read messages and receive message events in public channels (required for `@mention` replies and channel thread follow-ups) |
 | `channels:read` | View channel info |
 | `app_mentions:read` | Respond when @mentioned |
 | `users:write` | Update own presence info |
 
 Optional scopes for DM support:
-- `im:history` - Read direct messages
-- `im:write` - Send direct messages
+| Scope | Purpose |
+|-------|---------|
+| `im:history` | Read direct message history |
+| `im:read` | View direct message info |
+| `im:write` | Send direct messages |
 
 ## Step 3: Enable Socket Mode
 

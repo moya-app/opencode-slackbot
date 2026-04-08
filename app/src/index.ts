@@ -211,12 +211,10 @@ app.event("app_mention", async ({ event, client, context }) => {
   })
 })
 
-// ─── Direct messages ──────────────────────────────────────────────
+// ─── Direct messages + channel thread replies ─────────────────────
 
 app.event("message", async ({ event, client, context }) => {
   const message = event as any
-
-  if (message.channel_type !== "im") return
 
   if (message.subtype === "assistant_app_thread") return
   if (message.subtype) return
@@ -228,15 +226,21 @@ app.event("message", async ({ event, client, context }) => {
   const channel = message.channel as string
   const threadTs = (message.thread_ts || message.ts) as string
   const { userId, teamId } = context
+  const isDM = message.channel_type === "im"
 
-  console.log(`direct_message in channel ${channel}: "${text}"`)
+  // For channel messages, only respond if the bot already has a session for
+  // this thread (i.e. it was previously @mentioned here). This avoids the
+  // bot responding to every message in every channel it is a member of.
+  if (!isDM && !store.get(`${channel}-${threadTs}`)) return
+
+  console.log(`${isDM ? "direct_message" : "channel_thread_reply"} in channel ${channel}: "${text}"`)
 
   await runPrompt({
     client,
     channel,
     threadTs,
     text,
-    isChannel: false,
+    isChannel: !isDM,
     recipientTeamId: teamId as string,
     recipientUserId: userId as string,
     onError: async (errorMessage: string) => {
