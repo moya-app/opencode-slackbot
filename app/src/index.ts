@@ -23,7 +23,16 @@ console.log("- Signing secret present:", !!process.env.SLACK_SIGNING_SECRET)
 console.log("- App token present:", !!process.env.SLACK_APP_TOKEN)
 
 console.log("Starting opencode server...")
-const opencode = await createOpencode({ port: 0 })
+const opencode = await createOpencode({
+  port: 0,
+  config: {
+    agent: {
+      // Replace OpenCode's built-in system prompt with a blank string so that
+      // AGENTS.md is the sole source of system-level instructions.
+      build: { prompt: "" },
+    },
+  },
+})
 console.log("Opencode server ready")
 
 const store = new SessionStore()
