@@ -30,9 +30,21 @@ docker compose up -d
 docker compose logs -f opencode
 ```
 
-# Slack Setup Guide (one time - it's a bit of a pain...)
+# Slack Setup Guide
 
-## Overview
+## Manifest route
+
+There's a much quicker way to do all the below via uploading a manifest. See the example manifest.json file in this
+directory, modify it as necessary and then create the slack app as per step 1 below, but choose the 'From Manifest'
+option and paste the file in there to bypass a lot of the manual work below.
+
+You'll still need to do the install in step 8 below to get the bot token, then
+on the general page click 'App-Level Tokens' -> 'Generate Token and Scopes' and fill out that form per step 3 parts 3
+and 4 below. The signing secret is on the front page also.
+
+Then do steps 9 and 10 below.
+
+## Manual route
 
 The connector uses **Socket Mode** which allows real-time messaging without needing a public server or webhook URL. This makes it ideal for running locally or behind a firewall.
 
