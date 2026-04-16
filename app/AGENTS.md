@@ -39,6 +39,9 @@ This directory contains the Slack bot runtime that bridges Slack Assistant event
 - `src/tools.ts`
   - `buildToolChunk`: translates a `ToolPart` from the OpenCode SDK into a Slack `TaskUpdateChunk`.
 
+- `src/chart.ts`
+  - Vega-Lite chart rendering: `extractVegaLiteSpecs` parses `<vega-lite>...</vega-lite>` tags from response text, `renderAndUploadCharts` compiles specs to PNG (via `vega` + `vega-lite` + `@resvg/resvg-js`) and uploads them to the Slack thread.
+
 - `src/events.ts`
   - `startEventLoop`: subscribes to the OpenCode event stream and processes events in batched 350 ms flush windows. Handles `session.idle`, `message.updated`, `todo.updated`, `message.part.delta`, and `message.part.updated`.
 

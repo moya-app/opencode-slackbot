@@ -32,17 +32,14 @@ docker compose logs -f opencode
 
 # Slack Setup Guide
 
-## Manifest route
+## Manifest route (the quick way)
 
-There's a much quicker way to do all the below via uploading a manifest. See the example manifest.json file in this
-directory, modify it as necessary and then create the slack app as per step 1 below, but choose the 'From Manifest'
-option and paste the file in there to bypass a lot of the manual work below.
-
-You'll still need to do the install in step 8 below to get the bot token, then
-on the general page click 'App-Level Tokens' -> 'Generate Token and Scopes' and fill out that form per step 3 parts 3
-and 4 below. The signing secret is on the front page also.
-
-Then do steps 9 and 10 below.
+1. See the example manifest.json file in this directory, modify it as necessary and then create the slack app as per
+   step 1 below, but choose the 'From Manifest' option and paste the file in there and create the app.
+2. On the general page click 'App-Level Tokens' -> 'Generate Token and Scopes' and fill out that form per step 3 parts
+   3 below. Copy the app token.
+3. Copy the Signing Secret from that general page
+4. Install the app and configure per steps 8-10 below
 
 ## Manual route
 
@@ -66,6 +63,7 @@ The connector uses **Socket Mode** which allows real-time messaging without need
 | Scope | Purpose |
 |-------|---------|
 | `chat:write` | Send messages |
+| `files:read` | Download files and images shared in conversations |
 | `files:write` | Upload images |
 | `channels:history` | Read messages and receive message events in public channels (required for `@mention` replies and channel thread follow-ups) |
 | `channels:read` | View channel info |

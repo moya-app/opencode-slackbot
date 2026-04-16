@@ -7,8 +7,8 @@ ENV BUN_RUNTIME_TRANSPILER_CACHE_PATH=${BUN_RUNTIME_TRANSPILER_CACHE_PATH}
 
 WORKDIR /app
 
-# Install uv for most mcps
-RUN apt update && apt install -y curl procps && \
+# Install uv for most mcps, and fonts for chart rendering
+RUN apt update && apt install -y curl procps fonts-noto-core && \
     curl -LsSf https://astral.sh/uv/install.sh | sh && \
     bun install -g opencode-ai && \
     rm -rf /var/lib/apt/lists/*

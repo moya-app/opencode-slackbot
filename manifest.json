@@ -1,7 +1,7 @@
 {
     "display_information": {
-        "name": "Systest Moya Product Assistant",
-        "description": "Systest Moya Product Assistant",
+        "name": "MZ Opencode tester",
+        "description": "MZ Opencode tester",
         "background_color": "#42495e"
     },
     "features": {
@@ -11,7 +11,7 @@
             "messages_tab_read_only_enabled": false
         },
         "bot_user": {
-            "display_name": "Systest Moya Product Assistant",
+            "display_name": "MZ Opencode tester",
             "always_online": false
         },
         "assistant_view": {
@@ -28,6 +28,7 @@
                 "channels:history",
                 "channels:read",
                 "chat:write",
+                "files:read",
                 "files:write",
                 "im:history",
                 "im:write",

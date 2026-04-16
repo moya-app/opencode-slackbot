@@ -1,4 +1,5 @@
 import type { SessionState, SlackClient } from "./types"
+import { extractVegaLiteSpecs, renderAndUploadCharts } from "./chart"
 
 // Feedback block appended to every completed response
 export const feedbackBlock = {
@@ -57,8 +58,13 @@ export async function postResponseMeta(client: SlackClient, session: SessionStat
 }
 
 export async function postAssistantResponse(client: SlackClient, session: SessionState, text: string): Promise<boolean> {
-  const trimmed = text.trim()
-  if (!trimmed) return false
+  // Extract any <vega-lite> chart specs before posting text
+  const hasVegaTag = text.includes("<vega-lite>")
+  const { cleanedText: trimmed, charts } = extractVegaLiteSpecs(text.trim())
+  if (hasVegaTag) {
+    console.log(`postAssistantResponse: found <vega-lite> tag, extracted ${charts.length} chart(s), cleaned text length: ${trimmed.length}`)
+  }
+  if (!trimmed && charts.length === 0) return false
 
   if (trimmed.length > 12000) {
     try {
@@ -72,6 +78,9 @@ export async function postAssistantResponse(client: SlackClient, session: Sessio
         initial_comment: "Response is large, so I uploaded it as a file.",
       })
       await postResponseMeta(client, session)
+      if (charts.length > 0) {
+        await renderAndUploadCharts(client, session, charts)
+      }
       return true
     } catch (e) {
       console.error("Failed to upload large response as file, falling back to chunked messages:", e)
@@ -102,13 +111,18 @@ export async function postAssistantResponse(client: SlackClient, session: Sessio
     await client.chat.postMessage({
       channel: session.channel,
       thread_ts: session.thread,
-      text: chunks[0],
+      text: chunks[0] || "See chart below.",
       blocks,
       reply_broadcast: session.isChannel,
     })
   } catch (e) {
     console.error("Failed to post assistant response:", e)
     return false
+  }
+
+  // Render and upload any extracted vega-lite charts to the thread
+  if (charts.length > 0) {
+    await renderAndUploadCharts(client, session, charts)
   }
 
   return true

@@ -56,5 +56,8 @@
     "list_tables": "allow",
     "run_select_query": "allow",
   */
+    "external_directory": {
+      "/tmp/**": "allow",
+    },
   }
 }

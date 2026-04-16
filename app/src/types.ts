@@ -56,11 +56,23 @@ export type ActiveRunState = {
   textStreamed: boolean
 }
 
+export type IncomingAttachment = {
+  id?: string
+  name?: string
+  mimetype?: string
+  filetype?: string
+  url_private?: string
+  url_private_download?: string
+}
+
 export type PromptInput = {
   client: SlackClient
   channel: string
   threadTs: string
   text: string
+  files?: IncomingAttachment[]
+  /** Raw Slack attachments array — used to extract inline tables pasted into messages. */
+  attachments?: any[]
   isChannel: boolean
   recipientTeamId?: string
   recipientUserId?: string
