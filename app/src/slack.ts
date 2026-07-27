@@ -73,7 +73,6 @@ export async function postAssistantResponse(client: SlackClient, session: Sessio
         thread_ts: session.thread,
         title: "OpenCode response",
         filename: `opencode-response-${Date.now()}.md`,
-        filetype: "markdown",
         content: trimmed,
         initial_comment: "Response is large, so I uploaded it as a file.",
       })
