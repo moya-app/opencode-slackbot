@@ -51,6 +51,7 @@ Guidelines:
 - Embed the query result data directly in the spec's \`data.values\` field (keep to a reasonable number of data points -- pre-aggregate if needed)
 - Set \`width\` and \`height\` (e.g. 1200x800) for readable charts
 - Use clear axis labels and a descriptive title
+- CRITICAL: Do NOT use \`format\` on temporal axes (type: "temporal"). Vega-Lite uses d3-format (number formatting) for the \`format\` property, which will crash on time-like strings like "00:00" or "HH:MM". For temporal fields, use \`timeUnit\` (e.g. "hoursminutes", "yearmonthdate") to bin the data, and let Vega-Lite format the axis labels automatically. If you need custom time formatting, use \`axis.format\` with a d3-time-format string like \`"%H:%M"\` — NOT a raw time literal.
 
 Example:
 
