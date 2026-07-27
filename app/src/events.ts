@@ -29,9 +29,9 @@ export async function startEventLoop(
     try {
       if (thinkingUpdates.size > 0) {
         for (const [messageID, delta] of thinkingUpdates.entries()) {
-          // Only add thinking update if this messageID hasn't already been completed
           if (!session.thinkingMessageIDs.has(messageID)) continue
           const safe = delta.length > 600 ? delta.slice(-600) : delta
+          console.log(`[thinking] sending in_progress for thinking-${messageID} (${safe.length} chars)`)
           chunks.push({
             type: "task_update",
             id: `thinking-${messageID}`,
@@ -84,9 +84,11 @@ export async function startEventLoop(
     // On idle the task has completed so handle any message flushes, complete all tasks, give final message and cost
     // summary to user
     if (event.type === "session.idle") {
+      console.log(`[session] idle event received for sessionID=${event.properties.sessionID}`)
       const match = store.findBySessionId(event.properties.sessionID)
       if (!match) continue
       const [key, session] = match
+      console.log(`[session] idle: found session key=${key}, thinkingMessageIDs.size=${session.thinkingMessageIDs.size}`)
 
       const pendingEntry = pending.get(key)
       if (pendingEntry) {
@@ -102,32 +104,29 @@ export async function startEventLoop(
 
       const run = store.activeRuns.get(key)
       if (run && session.streamer) {
-        await session.streamer.append({
-          chunks: [{ type: "task_update", id: run.workingTaskId, title: "Working on your request", status: "complete" }],
-        }).catch((e) => {
-          console.error("Failed to append completed working task update:", e)
-        })
+        const stopChunks: AnyChunk[] = []
+
+        // Complete the working task
+        stopChunks.push({ type: "task_update", id: run.workingTaskId, title: "Working on your request", status: "complete" })
 
         // Complete any remaining thinking tasks not already completed by message.updated
         if (session.thinkingMessageIDs.size > 0) {
-          const completeThinkingChunks: AnyChunk[] = []
+          console.log(`[thinking] session.idle: completing ${session.thinkingMessageIDs.size} remaining thinking task(s): ${[...session.thinkingMessageIDs].join(", ")}`)
           for (const messageID of session.thinkingMessageIDs) {
-            completeThinkingChunks.push({
+            stopChunks.push({
               type: "task_update",
               id: `thinking-${messageID}`,
               title: "Thinking",
               status: "complete",
             })
           }
-          await session.streamer.append({ chunks: completeThinkingChunks }).catch((e) => {
-            console.error("Failed to complete thinking task updates:", e)
-          })
         }
 
-        // If no text was streamed, post a fallback assistant message with cost/feedback
-        // via postAssistantResponse (so it gets the feedback buttons) rather than
-        // embedding it in streamer.stop() which would not include them.
+        // If no text was streamed, include a fallback in the stop so the plan pane
+        // always receives some content — empty stop may cause Slack to show an error.
         if (!run.textStreamed) {
+          stopChunks.push({ type: "markdown_text", text: "I completed the request but did not receive a text response from model output." } as AnyChunk)
+          // Also post separately for cost/feedback (can't include blocks in stream chunks)
           await postAssistantResponse(
             client,
             session,
@@ -137,13 +136,13 @@ export async function startEventLoop(
           })
         }
 
-        await session.streamer.stop({
-          chunks: [],
-        }).catch((e) => {
+        console.log(`[session] idle: stopping streamer with ${stopChunks.length} stop chunk(s)`)
+        await session.streamer.stop({ chunks: stopChunks }).catch((e) => {
           console.error("Failed to stop stream on idle:", e)
         })
 
         session.streamer = null
+        console.log("[session] idle: streamer stopped")
       }
 
       store.activeRuns.delete(key)
@@ -178,11 +177,11 @@ export async function startEventLoop(
         // when a message finishes (any finish value), immediately complete its thinking task so it stops flashing.
         // Flush pending entry first so the in_progress task_update is sent before the complete.
         if (session.thinkingMessageIDs.has(info.id) && session.streamer) {
+          console.log(`[thinking] message finish for ${info.id} (finish=${info.finish}), flushing pending first`)
           const pendingEntry = pending.get(key)
           if (pendingEntry) {
-            pendingEntry.thinkingUpdates.delete(info.id)
+            pending.delete(key) // remove from map first so flush timer won't double-process
             await flushEntry(pendingEntry).catch(() => {})
-            pending.delete(key)
           }
           session.thinkingMessageIDs.delete(info.id)
           await session.streamer.append({
@@ -195,6 +194,7 @@ export async function startEventLoop(
           }).catch((e) => {
             console.error("Failed to complete thinking on message finish:", e)
           })
+          console.log(`[thinking] completed thinking-${info.id} via message finish`)
         }
       }
 
@@ -262,8 +262,10 @@ export async function startEventLoop(
       // guarantee), so we can't use messageFinishByID to decide. The thinking task
       // is completed in the message.updated handler when finish is set.
       const entry = getOrCreatePending(key, session)
-      if (!session.thinkingMessageIDs.has(messageID) && !session.messageFinishByID.has(messageID)) {
+      const isNew = !session.thinkingMessageIDs.has(messageID)
+      if (isNew && !session.messageFinishByID.has(messageID)) {
         session.thinkingMessageIDs.add(messageID)
+        console.log(`[thinking] registered thinking-${messageID} (from delta)`)
       }
       if (session.thinkingMessageIDs.has(messageID)) {
         const prevDelta = entry.thinkingUpdates.get(messageID) || ""
