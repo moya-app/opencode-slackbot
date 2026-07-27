@@ -176,11 +176,13 @@ export async function startEventLoop(
         session.messageFinishByID.set(info.id, info.finish)
 
         // when a message finishes (any finish value), immediately complete its thinking task so it stops flashing.
-        // Don't wait for session.idle.
+        // Flush pending entry first so the in_progress task_update is sent before the complete.
         if (session.thinkingMessageIDs.has(info.id) && session.streamer) {
           const pendingEntry = pending.get(key)
           if (pendingEntry) {
             pendingEntry.thinkingUpdates.delete(info.id)
+            await flushEntry(pendingEntry).catch(() => {})
+            pending.delete(key)
           }
           session.thinkingMessageIDs.delete(info.id)
           await session.streamer.append({
