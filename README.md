@@ -30,6 +30,12 @@ docker compose up -d
 docker compose logs -f opencode
 ```
 
+# To test opencode config without slack
+
+```bash
+docker compose exec opencode bash -c 'cd data; opencode'
+```
+
 # Slack Setup Guide
 
 ## Manifest route (the quick way)
