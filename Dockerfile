@@ -17,6 +17,8 @@ RUN apt update && apt install -y curl procps fonts-noto-core && \
 RUN echo | /root/.local/bin/uv run --python 3.10 --with mcp-clickhouse mcp-clickhouse
 
 COPY app/ .
+COPY entrypoint.sh /entrypoint.sh
 RUN bun install
 
+ENTRYPOINT ["/entrypoint.sh"]
 CMD ["bun", "start"]
