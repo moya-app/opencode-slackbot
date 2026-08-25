@@ -1,5 +1,6 @@
 import type { SessionState, SlackClient } from "./types"
 import { extractVegaLiteSpecs, renderAndUploadCharts } from "./chart"
+import { settings } from "./settings"
 
 // Feedback block appended to every completed response
 export const feedbackBlock = {
@@ -112,7 +113,7 @@ export async function postAssistantResponse(client: SlackClient, session: Sessio
       thread_ts: session.thread,
       text: chunks[0] || "See chart below.",
       blocks,
-      reply_broadcast: session.isChannel,
+      reply_broadcast: session.isChannel && settings.REPLY_BROADCAST,
     })
   } catch (e) {
     console.error("Failed to post assistant response:", e)

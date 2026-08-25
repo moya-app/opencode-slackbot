@@ -11,20 +11,23 @@ import type { PromptInput, SlackClient } from "./types"
 import type { IncomingAttachment } from "./types"
 import { SessionStore } from "./session"
 import { startEventLoop } from "./events"
+import { settings, blockedUsers, isBlockedUser } from "./settings"
 
 chdir(DATA_DIR)
 
 const app = new App({
-  token: process.env.SLACK_BOT_TOKEN,
-  signingSecret: process.env.SLACK_SIGNING_SECRET,
+  token: settings.SLACK_BOT_TOKEN,
+  signingSecret: settings.SLACK_SIGNING_SECRET,
   socketMode: true,
-  appToken: process.env.SLACK_APP_TOKEN,
+  appToken: settings.SLACK_APP_TOKEN,
 })
 
 console.log("Bot configuration:")
-console.log("- Bot token present:", !!process.env.SLACK_BOT_TOKEN)
-console.log("- Signing secret present:", !!process.env.SLACK_SIGNING_SECRET)
-console.log("- App token present:", !!process.env.SLACK_APP_TOKEN)
+console.log("- Bot token present:", !!settings.SLACK_BOT_TOKEN)
+console.log("- Signing secret present:", !!settings.SLACK_SIGNING_SECRET)
+console.log("- App token present:", !!settings.SLACK_APP_TOKEN)
+console.log("- Blocked users:", blockedUsers.size === 0 ? "(none)" : [...blockedUsers].join(", "))
+console.log("- Reply broadcast:", settings.REPLY_BROADCAST)
 
 console.log("Starting opencode server...")
 const opencode = await createOpencode({
@@ -156,7 +159,7 @@ type StagedFile = { path: string; name: string; mime: string }
 async function stageAttachments(files: IncomingAttachment[] | undefined, client: SlackClient): Promise<StagedFile[]> {
   if (!files?.length) return []
 
-  const token = process.env.SLACK_BOT_TOKEN
+  const token = settings.SLACK_BOT_TOKEN
   if (!token) {
     console.error("Cannot download attachments: SLACK_BOT_TOKEN is not set")
     return []
@@ -393,6 +396,12 @@ const assistant = new Assistant({
     const { channel, thread_ts } = message
     const { userId, teamId } = context
 
+    if (isBlockedUser(userId as string)) {
+      console.log(`Rejected request from blocked user ${userId}`)
+      await say({ text: "Sorry, you are not authorized to use this bot." }).catch(() => {})
+      return
+    }
+
     const messageText = typeof message.text === "string" ? message.text : ""
     const msgAny = message as any
 
@@ -430,6 +439,16 @@ app.event("app_mention", async ({ event, client, context }) => {
   const { userId, teamId } = context
 
   console.log(`app_mention in channel ${channel}: "${text}"`)
+
+  if (isBlockedUser(userId as string)) {
+    console.log(`Rejected request from blocked user ${userId}`)
+    await client.chat.postEphemeral({
+      channel,
+      user: userId as string,
+      text: "Sorry, you are not authorized to use this bot.",
+    }).catch(() => {})
+    return
+  }
 
   if (!text && !files?.length && !eventAttachments?.length) return
 
@@ -474,6 +493,16 @@ app.event("message", async ({ event, client, context }) => {
   const threadTs = (message.thread_ts || message.ts) as string
   const { userId, teamId } = context
   const isDM = message.channel_type === "im"
+
+  if (isBlockedUser(userId as string)) {
+    console.log(`Rejected request from blocked user ${userId}`)
+    await client.chat.postEphemeral({
+      channel,
+      user: userId as string,
+      text: "Sorry, you are not authorized to use this bot.",
+    }).catch(() => {})
+    return
+  }
 
   // For channel messages, only respond if the bot already has a session for
   // this thread (i.e. it was previously @mentioned here). This avoids the
