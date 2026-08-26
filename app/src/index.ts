@@ -28,6 +28,25 @@ console.log("- Signing secret present:", !!settings.SLACK_SIGNING_SECRET)
 console.log("- App token present:", !!settings.SLACK_APP_TOKEN)
 console.log("- Blocked users:", blockedUsers.size === 0 ? "(none)" : [...blockedUsers].join(", "))
 console.log("- Reply broadcast:", settings.REPLY_BROADCAST)
+console.log("- Restrict to workspace:", settings.RESTRICT_TO_WORKSPACE)
+
+// When RESTRICT_TO_WORKSPACE is enabled, resolve the bot's own workspace team id
+// at startup and reject any request from a user in a different workspace.
+let workspaceTeamId: string | undefined
+if (settings.RESTRICT_TO_WORKSPACE) {
+  try {
+    const auth = await app.client.auth.test()
+    workspaceTeamId = auth.team_id as string
+    console.log(`- Workspace team id: ${workspaceTeamId}`)
+  } catch (e) {
+    console.error("Failed to fetch workspace team id; workspace restriction disabled:", e)
+  }
+}
+
+function isUnauthorized(userId: string | undefined, userTeamId: string | undefined): boolean {
+  if (isBlockedUser(userId)) return true
+  return !!workspaceTeamId && !!userTeamId && userTeamId !== workspaceTeamId
+}
 
 console.log("Starting opencode server...")
 const opencode = await createOpencode({
@@ -396,8 +415,8 @@ const assistant = new Assistant({
     const { channel, thread_ts } = message
     const { userId, teamId } = context
 
-    if (isBlockedUser(userId as string)) {
-      console.log(`Rejected request from blocked user ${userId}`)
+    if (isUnauthorized(userId as string, teamId as string)) {
+      console.log(`Rejected request from unauthorized user ${userId}`)
       await say({ text: "Sorry, you are not authorized to use this bot." }).catch(() => {})
       return
     }
@@ -437,11 +456,12 @@ app.event("app_mention", async ({ event, client, context }) => {
   const files = (event as any).files as IncomingAttachment[] | undefined
   const eventAttachments = (event as any).attachments as any[] | undefined
   const { userId, teamId } = context
+  const userTeamId = (event as any).user_team ?? teamId
 
   console.log(`app_mention in channel ${channel}: "${text}"`)
 
-  if (isBlockedUser(userId as string)) {
-    console.log(`Rejected request from blocked user ${userId}`)
+  if (isUnauthorized(userId as string, userTeamId as string)) {
+    console.log(`Rejected request from unauthorized user ${userId}`)
     await client.chat.postEphemeral({
       channel,
       user: userId as string,
@@ -493,9 +513,10 @@ app.event("message", async ({ event, client, context }) => {
   const threadTs = (message.thread_ts || message.ts) as string
   const { userId, teamId } = context
   const isDM = message.channel_type === "im"
+  const userTeamId = message.user_team ?? teamId
 
-  if (isBlockedUser(userId as string)) {
-    console.log(`Rejected request from blocked user ${userId}`)
+  if (isUnauthorized(userId as string, userTeamId as string)) {
+    console.log(`Rejected request from unauthorized user ${userId}`)
     await client.chat.postEphemeral({
       channel,
       user: userId as string,
