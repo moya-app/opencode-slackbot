@@ -40,6 +40,8 @@ export type SessionState = {
   assistantMessageIDs: Set<string>
   lastModelID: string
   usage: SessionUsage
+  /** Formatted error from a failed step/execution, surfaced to Slack on failure. */
+  lastError: string
 }
 
 export type ActiveRunState = {

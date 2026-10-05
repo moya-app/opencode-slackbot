@@ -23,6 +23,19 @@ type PendingEntry = {
   thinkingUpdates: Map<string, string>
 }
 
+/** Format a structured OpenCode error (e.g. `provider.auth`) for Slack. */
+function formatSessionError(error: unknown): string {
+  if (typeof error === "string") return error.trim()
+  const e = error as { type?: unknown; message?: unknown; status?: unknown } | undefined
+  if (!e || typeof e !== "object") return ""
+  const message = typeof e.message === "string" ? e.message.trim() : ""
+  const bits: string[] = []
+  if (message) bits.push(message)
+  if (typeof e.status === "number") bits.push(`HTTP ${e.status}`)
+  if (typeof e.type === "string" && e.type.length > 0 && e.type !== "unknown") bits.push(`(${e.type})`)
+  return bits.join(" ")
+}
+
 export async function startEventLoop(
   opencode: EventSource,
   client: SlackClient,
@@ -121,7 +134,7 @@ export async function startEventLoop(
    * the first of `session.execution.succeeded/failed/interrupted` or
    * `session.idle` to arrive wins; later ones are no-ops.
    */
-  async function finalizeSession(key: string, session: SessionState, failed: boolean, reason?: string) {
+  async function finalizeSession(key: string, session: SessionState, failed: boolean) {
     if (!store.activeRuns.has(key)) return
 
     const pendingEntry = pending.get(key)
@@ -134,15 +147,22 @@ export async function startEventLoop(
     const run = store.activeRuns.get(key)
     if (run && published) run.textStreamed = true
 
-    const fallback = failed
-      ? `Sorry, something went wrong${reason ? `: ${reason}` : ""}. Please try again.`
-      : "I completed the request but did not receive a text response from model output."
+    // Decide what (if anything) the user still needs to see for this run. On
+    // failure we always post an explanation, even if partial text was already
+    // published, so errors are never silent.
+    let outcomeText: string | null = null
+    if (failed) {
+      const detail = session.lastError.trim()
+      outcomeText = detail
+        ? `:warning: Sorry, I couldn't complete that request: ${detail}`
+        : ":warning: Sorry, something went wrong while working on that request. Please try again."
+    } else if (!published) {
+      outcomeText = "I completed the request but did not receive a text response from model output."
+    }
 
-    // Always make sure the user gets *something*, even if the live stream
-    // expired before any final text could be published.
-    if (run && !published) {
-      await postAssistantResponse(client, session, fallback).catch((e) => {
-        console.error("Failed to post fallback response:", e)
+    if (outcomeText) {
+      await postAssistantResponse(client, session, outcomeText).catch((e) => {
+        console.error("Failed to post run outcome to Slack:", e)
       })
     }
 
@@ -168,10 +188,9 @@ export async function startEventLoop(
         }
       }
 
-      // If no final message was published, include a fallback so the plan pane
-      // is never left empty.
-      if (!published) {
-        stopChunks.push({ type: "markdown_text", text: fallback } as AnyChunk)
+      // Surface the outcome (error or no-text fallback) in the plan pane too.
+      if (outcomeText) {
+        stopChunks.push({ type: "markdown_text", text: outcomeText } as AnyChunk)
       }
 
       console.log(`[session] finalize: stopping streamer with ${stopChunks.length} stop chunk(s)`)
@@ -265,6 +284,8 @@ export async function startEventLoop(
         if (!match) break
         const [, session] = match
         session.assistantMessageIDs.add(assistantMessageID)
+        // A new step means any earlier failure was retried; clear it.
+        session.lastError = ""
         if (model) {
           session.lastModelID = model.variant
             ? `${model.providerID}/${model.id}#${model.variant}`
@@ -298,6 +319,8 @@ export async function startEventLoop(
         if (!match) break
         const [key, session] = match
         console.error(`[session] step failed for ${assistantMessageID}:`, error)
+        const detail = formatSessionError(error)
+        if (detail) session.lastError = detail
         await completeThinking(key, session, assistantMessageID)
         break
       }
@@ -383,17 +406,20 @@ export async function startEventLoop(
         if (!match) break
         const [key, session] = match
         console.error(`[session] execution failed for ${sessionID}:`, error)
+        const detail = formatSessionError(error)
+        if (detail) session.lastError = detail
         await finalizeSession(key, session, true)
         break
       }
 
       case "session.execution.interrupted": {
-        const { sessionID } = event.data
+        const { sessionID, reason } = event.data
         const match = store.findBySessionId(sessionID)
         if (!match) break
         const [key, session] = match
-        console.log(`[session] execution interrupted for ${sessionID}`)
-        await finalizeSession(key, session, false)
+        console.log(`[session] execution interrupted for ${sessionID} (${reason})`)
+        if (!session.lastError) session.lastError = `the run was interrupted (${reason})`
+        await finalizeSession(key, session, true)
         break
       }
 
@@ -414,7 +440,8 @@ export async function startEventLoop(
         if (!match) break
         const [key, session] = match
         console.log(`[session] idle: found session key=${key}, thinkingMessageIDs.size=${session.thinkingMessageIDs.size}`)
-        await finalizeSession(key, session, false)
+        // If a step failed and no execution event carried the error, surface it.
+        await finalizeSession(key, session, session.lastError.trim().length > 0)
         break
       }
 
