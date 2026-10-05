@@ -1,10 +1,14 @@
 import type { AnyChunk } from "@slack/types"
+import type { OpenCodeEvent } from "@opencode/sdk"
 import type { SlackClient, SessionState } from "./types"
 import type { SessionStore } from "./session"
-import { parseMessageUsage, applyUsageDelta, emptyUsage } from "./usage"
-import { parseTodos, buildTodoChunks } from "./todo"
 import { buildToolChunk } from "./tools"
-import { tryPublishFinalMessage, publishPendingFinalMessages, postAssistantResponse, registerTextPart, clearTextPartsForMessage } from "./slack"
+import { appendTextPart, setTextPart, tryPublishFinalMessage, publishPendingFinalMessages, postAssistantResponse } from "./slack"
+
+/** Minimal structural type for the embedded OpenCode host — avoids a hard import. */
+type EventSource = {
+  events: { subscribe: (options?: { signal?: AbortSignal }) => AsyncIterable<OpenCodeEvent> }
+}
 
 type PendingEntry = {
   session: SessionState
@@ -13,12 +17,10 @@ type PendingEntry = {
 }
 
 export async function startEventLoop(
-  opencode: { client: { event: { subscribe: () => Promise<{ stream: AsyncIterable<any> }> } } },
+  opencode: EventSource,
   client: SlackClient,
   store: SessionStore,
 ): Promise<void> {
-  const events = await opencode.client.event.subscribe()
-
   const pending = new Map<string, PendingEntry>()
   let flushTimer: ReturnType<typeof setTimeout> | null = null
 
@@ -31,7 +33,6 @@ export async function startEventLoop(
         for (const [messageID, delta] of thinkingUpdates.entries()) {
           if (!session.thinkingMessageIDs.has(messageID)) continue
           const safe = delta.length > 600 ? delta.slice(-600) : delta
-          console.log(`[thinking] sending in_progress for thinking-${messageID} (${safe.length} chars)`)
           chunks.push({
             type: "task_update",
             id: `thinking-${messageID}`,
@@ -77,258 +78,339 @@ export async function startEventLoop(
     }
   }
 
-  for await (const event of events.stream) {
-    //console.log(event)
-    const eventAny = event as any
+  /** Start an in-progress "Thinking" task for an assistant message. */
+  function startThinking(session: SessionState, messageID: string) {
+    if (session.thinkingMessageIDs.has(messageID)) return
+    if (session.messageFinishByID.has(messageID)) return
+    session.thinkingMessageIDs.add(messageID)
+    console.log(`[thinking] registered thinking-${messageID}`)
+  }
 
-    // On idle the task has completed so handle any message flushes, complete all tasks, give final message and cost
-    // summary to user
-    if (event.type === "session.idle") {
-      console.log(`[session] idle event received for sessionID=${event.properties.sessionID}`)
-      const match = store.findBySessionId(event.properties.sessionID)
-      if (!match) continue
-      const [key, session] = match
-      console.log(`[session] idle: found session key=${key}, thinkingMessageIDs.size=${session.thinkingMessageIDs.size}`)
+  /** Queue a thinking delta for the next flush. */
+  function streamThinking(entry: PendingEntry, session: SessionState, messageID: string, delta: string) {
+    if (!session.thinkingMessageIDs.has(messageID)) return
+    const previous = entry.thinkingUpdates.get(messageID) ?? ""
+    entry.thinkingUpdates.set(messageID, previous + delta)
+  }
 
-      const pendingEntry = pending.get(key)
-      if (pendingEntry) {
-        pending.delete(key)
-        await flushEntry(pendingEntry)
+  /** Flush any pending thinking output, then mark the thinking task complete. */
+  async function completeThinking(key: string, session: SessionState, messageID: string) {
+    if (!session.thinkingMessageIDs.has(messageID)) return
+    const pendingEntry = pending.get(key)
+    if (pendingEntry) {
+      pending.delete(key) // remove first so the flush timer can't double-process
+      await flushEntry(pendingEntry).catch(() => {})
+    }
+    session.thinkingMessageIDs.delete(messageID)
+    if (session.streamer) {
+      await session.streamer.append({
+        chunks: [{ type: "task_update", id: `thinking-${messageID}`, title: "Thinking", status: "complete" }],
+      }).catch((e) => {
+        console.error("Failed to complete thinking task:", e)
+      })
+    }
+  }
+
+  /**
+   * Finish a run: flush pending stream output, publish any final message,
+   * complete the working/thinking tasks, and stop the stream. Idempotent —
+   * the first of `session.execution.succeeded/failed/interrupted` or
+   * `session.idle` to arrive wins; later ones are no-ops.
+   */
+  async function finalizeSession(key: string, session: SessionState, failed: boolean, reason?: string) {
+    if (!store.activeRuns.has(key)) return
+
+    const pendingEntry = pending.get(key)
+    if (pendingEntry) {
+      pending.delete(key)
+      await flushEntry(pendingEntry)
+    }
+
+    const published = await publishPendingFinalMessages(client, session)
+    const run = store.activeRuns.get(key)
+    if (run && published) run.textStreamed = true
+
+    if (run && session.streamer) {
+      const stopChunks: AnyChunk[] = []
+
+      stopChunks.push({
+        type: "task_update",
+        id: run.workingTaskId,
+        title: "Working on your request",
+        status: failed ? "error" : "complete",
+      })
+
+      if (session.thinkingMessageIDs.size > 0) {
+        console.log(`[session] finalize: completing ${session.thinkingMessageIDs.size} thinking task(s)`)
+        for (const messageID of session.thinkingMessageIDs) {
+          stopChunks.push({
+            type: "task_update",
+            id: `thinking-${messageID}`,
+            title: "Thinking",
+            status: failed ? "error" : "complete",
+          })
+        }
       }
 
-      const published = await publishPendingFinalMessages(client, session)
-      if (published) {
+      // If no text was streamed, include a fallback so the plan pane is never empty.
+      if (!run.textStreamed) {
+        const fallback = failed
+          ? `Sorry, something went wrong${reason ? `: ${reason}` : ""}. Please try again.`
+          : "I completed the request but did not receive a text response from model output."
+        stopChunks.push({ type: "markdown_text", text: fallback } as AnyChunk)
+        await postAssistantResponse(client, session, fallback).catch((e) => {
+          console.error("Failed to post fallback response:", e)
+        })
+      }
+
+      console.log(`[session] finalize: stopping streamer with ${stopChunks.length} stop chunk(s)`)
+      await session.streamer.stop({ chunks: stopChunks }).catch((e) => {
+        console.error("Failed to stop stream on finalize:", e)
+      })
+
+      session.streamer = null
+    }
+
+    store.activeRuns.delete(key)
+    store.resetRunState(session)
+  }
+
+  for await (const event of opencode.events.subscribe()) {
+    switch (event.type) {
+      // ── Text output ──────────────────────────────────────────────
+      case "session.text.started": {
+        const { sessionID, assistantMessageID } = event.data
+        const match = store.findBySessionId(sessionID)
+        if (!match) break
+        const [, session] = match
+        session.assistantMessageIDs.add(assistantMessageID)
+        startThinking(session, assistantMessageID)
+        scheduleFlush()
+        break
+      }
+
+      case "session.text.delta": {
+        const { sessionID, assistantMessageID, ordinal, delta } = event.data
+        const match = store.findBySessionId(sessionID)
+        if (!match) break
+        const [key, session] = match
+        if (!session.streamer) break
+        session.assistantMessageIDs.add(assistantMessageID)
+        appendTextPart(session, assistantMessageID, ordinal, delta)
+
+        const entry = getOrCreatePending(key, session)
+        startThinking(session, assistantMessageID)
+        streamThinking(entry, session, assistantMessageID, delta)
+
         const run = store.activeRuns.get(key)
         if (run) run.textStreamed = true
+
+        scheduleFlush()
+        break
       }
 
-      const run = store.activeRuns.get(key)
-      if (run && session.streamer) {
-        const stopChunks: AnyChunk[] = []
+      case "session.text.ended": {
+        const { sessionID, assistantMessageID, ordinal, text } = event.data
+        const match = store.findBySessionId(sessionID)
+        if (!match) break
+        const [key, session] = match
+        session.assistantMessageIDs.add(assistantMessageID)
+        setTextPart(session, assistantMessageID, ordinal, text)
 
-        // Complete the working task
-        stopChunks.push({ type: "task_update", id: run.workingTaskId, title: "Working on your request", status: "complete" })
-
-        // Complete any remaining thinking tasks not already completed by message.updated
-        if (session.thinkingMessageIDs.size > 0) {
-          console.log(`[thinking] session.idle: completing ${session.thinkingMessageIDs.size} remaining thinking task(s): ${[...session.thinkingMessageIDs].join(", ")}`)
-          for (const messageID of session.thinkingMessageIDs) {
-            stopChunks.push({
-              type: "task_update",
-              id: `thinking-${messageID}`,
-              title: "Thinking",
-              status: "complete",
-            })
-          }
-        }
-
-        // If no text was streamed, include a fallback in the stop so the plan pane
-        // always receives some content — empty stop may cause Slack to show an error.
-        if (!run.textStreamed) {
-          stopChunks.push({ type: "markdown_text", text: "I completed the request but did not receive a text response from model output." } as AnyChunk)
-          // Also post separately for cost/feedback (can't include blocks in stream chunks)
-          await postAssistantResponse(
-            client,
-            session,
-            "I completed the request but did not receive a text response from model output.",
-          ).catch((e) => {
-            console.error("Failed to post no-text fallback response:", e)
-          })
-        }
-
-        console.log(`[session] idle: stopping streamer with ${stopChunks.length} stop chunk(s)`)
-        await session.streamer.stop({ chunks: stopChunks }).catch((e) => {
-          console.error("Failed to stop stream on idle:", e)
-        })
-
-        session.streamer = null
-        console.log("[session] idle: streamer stopped")
-      }
-
-      store.activeRuns.delete(key)
-      store.resetRunState(session)
-    } else if (event.type === "message.updated") {
-      const info = event.properties.info
-      const match = store.findBySessionId(info.sessionID)
-      if (!match) continue
-      const [key, session] = match
-
-      if (info.role !== "assistant") {
-        // Clean up any text parts registered for non-assistant messages
-        // so they don't appear in fallback publishing
-        clearTextPartsForMessage(session, info.id)
-        continue
-      }
-
-      session.assistantMessageIDs.add(info.id)
-
-      const nextUsage = parseMessageUsage(info)
-      const previousUsage = session.messageUsageById.get(info.id) ?? emptyUsage()
-
-      applyUsageDelta(session.usage, previousUsage, nextUsage)
-      session.messageUsageById.set(info.id, nextUsage)
-      if (typeof info.modelID === "string" && info.modelID.length > 0) {
-        session.lastModelID = info.modelID
-      }
-
-      if (typeof info.finish === "string") {
-        session.messageFinishByID.set(info.id, info.finish)
-
-        // when a message finishes (any finish value), immediately complete its thinking task so it stops flashing.
-        // Flush pending entry first so the in_progress task_update is sent before the complete.
-        if (session.thinkingMessageIDs.has(info.id) && session.streamer) {
-          console.log(`[thinking] message finish for ${info.id} (finish=${info.finish}), flushing pending first`)
-          const pendingEntry = pending.get(key)
-          if (pendingEntry) {
-            pending.delete(key) // remove from map first so flush timer won't double-process
-            await flushEntry(pendingEntry).catch(() => {})
-          }
-          session.thinkingMessageIDs.delete(info.id)
-          await session.streamer.append({
-            chunks: [{
-              type: "task_update",
-              id: `thinking-${info.id}`,
-              title: "Thinking",
-              status: "complete",
-            }],
-          }).catch((e) => {
-            console.error("Failed to complete thinking on message finish:", e)
-          })
-          console.log(`[thinking] completed thinking-${info.id} via message finish`)
-        }
-      }
-
-      if (info.finish === "stop") {
-        const posted = await tryPublishFinalMessage(client, session, info.id)
+        const posted = await tryPublishFinalMessage(client, session, assistantMessageID)
         if (posted) {
           const run = store.activeRuns.get(key)
           if (run) run.textStreamed = true
         }
+        break
       }
-    } else if (event.type === "todo.updated") {
-      const match = store.findBySessionId(event.properties.sessionID)
-      if (!match) continue
-      const [key, session] = match
-      const nextTodos = parseTodos(event.properties.todos as unknown)
-      const todoChunks = buildTodoChunks(session.todos, nextTodos)
-      session.todos = nextTodos
 
-      if (todoChunks.length > 0) {
+      // ── Reasoning (thinking) output ──────────────────────────────
+      case "session.reasoning.started": {
+        const { sessionID, assistantMessageID } = event.data
+        const match = store.findBySessionId(sessionID)
+        if (!match) break
+        const [, session] = match
+        session.assistantMessageIDs.add(assistantMessageID)
+        startThinking(session, assistantMessageID)
+        break
+      }
+
+      case "session.reasoning.delta": {
+        const { sessionID, assistantMessageID, delta } = event.data
+        const match = store.findBySessionId(sessionID)
+        if (!match) break
+        const [key, session] = match
+        if (!session.streamer) break
         const entry = getOrCreatePending(key, session)
-        entry.chunks.push(...todoChunks)
+        startThinking(session, assistantMessageID)
+        streamThinking(entry, session, assistantMessageID, delta)
         scheduleFlush()
+        break
       }
-    } else if (eventAny.type === "message.part.delta") {
-      if (eventAny.properties?.field !== "text") continue
 
-      const match = store.findBySessionId(eventAny.properties?.sessionID)
-      if (!match) continue
-      const [key, session] = match
-      if (!session.streamer) continue
-
-      const partId = eventAny.properties?.partID
-      const messageID = eventAny.properties?.messageID
-      const delta = eventAny.properties?.delta
-      if (typeof partId !== "string" || partId.length === 0) continue
-      if (typeof messageID !== "string" || messageID.length === 0) continue
-      if (typeof delta !== "string" || delta.length === 0) continue
-
-      // Reasoning-part deltas feed the thinking stream task but must not be
-      // registered as publishable text — they are thinking traces, not the
-      // final answer. (gpt-5.4 and other reasoning models emit reasoning parts
-      // before the actual text part, causing the full thought chain to appear
-      // in the posted Slack message if we don't exclude them here.)
-      if (session.reasoningPartIDs.has(partId)) {
-        const entry = getOrCreatePending(key, session)
-        if (!session.thinkingMessageIDs.has(messageID) && !session.messageFinishByID.has(messageID)) {
-          session.thinkingMessageIDs.add(messageID)
+      // ── Steps ────────────────────────────────────────────────────
+      case "session.step.started": {
+        const { sessionID, assistantMessageID, model } = event.data
+        const match = store.findBySessionId(sessionID)
+        if (!match) break
+        const [, session] = match
+        session.assistantMessageIDs.add(assistantMessageID)
+        if (model) {
+          session.lastModelID = model.variant
+            ? `${model.providerID}/${model.id}#${model.variant}`
+            : `${model.providerID}/${model.id}`
+          store.persistModelId(session)
         }
-        if (session.thinkingMessageIDs.has(messageID)) {
-          const prevDelta = entry.thinkingUpdates.get(messageID) || ""
-          entry.thinkingUpdates.set(messageID, prevDelta + delta)
-        }
-        scheduleFlush()
-        continue
+        break
       }
 
-      registerTextPart(session, messageID, partId)
+      case "session.step.ended": {
+        const { sessionID, assistantMessageID, finish } = event.data
+        const match = store.findBySessionId(sessionID)
+        if (!match) break
+        const [key, session] = match
+        session.messageFinishByID.set(assistantMessageID, finish)
+        await completeThinking(key, session, assistantMessageID)
 
-      const previous = session.textPartStates.get(partId) || ""
-      const next = previous + delta
-      session.textPartStates.set(partId, next)
-
-      // Mark as thinking on the very first delta for this message — regardless of
-      // finish state. message.updated may arrive before or after deltas (no ordering
-      // guarantee), so we can't use messageFinishByID to decide. The thinking task
-      // is completed in the message.updated handler when finish is set.
-      const entry = getOrCreatePending(key, session)
-      const isNew = !session.thinkingMessageIDs.has(messageID)
-      if (isNew && !session.messageFinishByID.has(messageID)) {
-        session.thinkingMessageIDs.add(messageID)
-        console.log(`[thinking] registered thinking-${messageID} (from delta)`)
-      }
-      if (session.thinkingMessageIDs.has(messageID)) {
-        const prevDelta = entry.thinkingUpdates.get(messageID) || ""
-        entry.thinkingUpdates.set(messageID, prevDelta + delta)
-      }
-
-      const run = store.activeRuns.get(key)
-      if (run) run.textStreamed = true
-
-      // If this message already has finish=stop (message.updated arrived before
-      // all deltas), attempt to publish now that we have more text.
-      const posted = await tryPublishFinalMessage(client, session, messageID)
-      if (posted) {
-        const activeRun = store.activeRuns.get(key)
-        if (activeRun) activeRun.textStreamed = true
-      }
-
-      scheduleFlush()
-    } else if (event.type === "message.part.updated") {
-      const part = event.properties.part
-      const match = store.findBySessionId(part.sessionID)
-      if (!match) continue
-      const [key, session] = match
-      if (!session.streamer) continue
-
-      const entry = getOrCreatePending(key, session)
-
-      if (part.type === "tool") {
-        const chunk = buildToolChunk(part, session)
-        if (chunk) entry.chunks.push(chunk)
-      } else if (part.type === "reasoning") {
-        // Mark this part ID so its text deltas are routed to the thinking stream
-        // only — not accumulated into the publishable message text.
-        session.reasoningPartIDs.add(part.id)
-      } else if (part.type === "text") {
-        registerTextPart(session, part.messageID, part.id)
-        const previous = session.textPartStates.get(part.id) || ""
-        const next = typeof part.text === "string" ? part.text : previous
-        if (next !== previous) {
-          session.textPartStates.set(part.id, next)
-
-          // Bug 1: only queue thinking updates for messages not already finished
-          if (session.thinkingMessageIDs.has(part.messageID)) {
-            if (next.startsWith(previous)) {
-              const delta = next.slice(previous.length)
-              if (delta.length > 0) {
-                const prevDelta = entry.thinkingUpdates.get(part.messageID) || ""
-                entry.thinkingUpdates.set(part.messageID, prevDelta + delta)
-              }
-            } else if (next.length > 0) {
-              entry.thinkingUpdates.set(part.messageID, next)
-            }
-          }
-
-          const posted = await tryPublishFinalMessage(client, session, part.messageID)
+        if (finish === "stop") {
+          const posted = await tryPublishFinalMessage(client, session, assistantMessageID)
           if (posted) {
             const run = store.activeRuns.get(key)
             if (run) run.textStreamed = true
           }
         }
+        break
       }
 
-      scheduleFlush()
+      case "session.step.failed": {
+        const { sessionID, assistantMessageID, error } = event.data
+        const match = store.findBySessionId(sessionID)
+        if (!match) break
+        const [key, session] = match
+        console.error(`[session] step failed for ${assistantMessageID}:`, error)
+        await completeThinking(key, session, assistantMessageID)
+        break
+      }
+
+      // ── Tools ────────────────────────────────────────────────────
+      case "session.tool.input.started": {
+        const { sessionID, id, name } = event.data
+        const match = store.findBySessionId(sessionID)
+        if (!match) break
+        const [key, session] = match
+        if (!session.streamer) break
+        session.toolNames.set(id, name)
+        const chunk = buildToolChunk({ id, name, status: "in_progress" })
+        if (chunk) {
+          const entry = getOrCreatePending(key, session)
+          entry.chunks.push(chunk)
+          scheduleFlush()
+        }
+        break
+      }
+
+      case "session.tool.called": {
+        const { sessionID, id, input } = event.data
+        const match = store.findBySessionId(sessionID)
+        if (!match) break
+        const [key, session] = match
+        if (!session.streamer) break
+        const name = session.toolNames.get(id) ?? id
+        const chunk = buildToolChunk({ id, name, input, status: "in_progress" })
+        if (chunk) {
+          const entry = getOrCreatePending(key, session)
+          entry.chunks.push(chunk)
+          scheduleFlush()
+        }
+        break
+      }
+
+      case "session.tool.success": {
+        const { sessionID, id } = event.data
+        const match = store.findBySessionId(sessionID)
+        if (!match) break
+        const [key, session] = match
+        if (!session.streamer) break
+        const name = session.toolNames.get(id) ?? id
+        const chunk = buildToolChunk({ id, name, status: "complete" })
+        if (chunk) {
+          const entry = getOrCreatePending(key, session)
+          entry.chunks.push(chunk)
+          scheduleFlush()
+        }
+        break
+      }
+
+      case "session.tool.failed": {
+        const { sessionID, id } = event.data
+        const match = store.findBySessionId(sessionID)
+        if (!match) break
+        const [key, session] = match
+        if (!session.streamer) break
+        const name = session.toolNames.get(id) ?? id
+        const chunk = buildToolChunk({ id, name, status: "error" })
+        if (chunk) {
+          const entry = getOrCreatePending(key, session)
+          entry.chunks.push(chunk)
+          scheduleFlush()
+        }
+        break
+      }
+
+      // ── Usage ────────────────────────────────────────────────────
+      case "session.usage.updated": {
+        const { sessionID, cost, tokens } = event.data
+        const match = store.findBySessionId(sessionID)
+        if (!match) break
+        const [, session] = match
+        session.usage = { cost, tokens }
+        break
+      }
+
+      case "session.execution.failed": {
+        const { sessionID, error } = event.data
+        const match = store.findBySessionId(sessionID)
+        if (!match) break
+        const [key, session] = match
+        console.error(`[session] execution failed for ${sessionID}:`, error)
+        await finalizeSession(key, session, true)
+        break
+      }
+
+      case "session.execution.interrupted": {
+        const { sessionID } = event.data
+        const match = store.findBySessionId(sessionID)
+        if (!match) break
+        const [key, session] = match
+        console.log(`[session] execution interrupted for ${sessionID}`)
+        await finalizeSession(key, session, false)
+        break
+      }
+
+      // ── Execution finished → finalise ────────────────────────────
+      case "session.execution.succeeded": {
+        const { sessionID } = event.data
+        const match = store.findBySessionId(sessionID)
+        if (!match) break
+        const [key, session] = match
+        await finalizeSession(key, session, false)
+        break
+      }
+
+      case "session.idle": {
+        const { sessionID } = event.data
+        console.log(`[session] idle event received for sessionID=${sessionID}`)
+        const match = store.findBySessionId(sessionID)
+        if (!match) break
+        const [key, session] = match
+        console.log(`[session] idle: found session key=${key}, thinkingMessageIDs.size=${session.thinkingMessageIDs.size}`)
+        await finalizeSession(key, session, false)
+        break
+      }
+
+      default:
+        break
     }
   }
 }

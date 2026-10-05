@@ -1,52 +1,52 @@
 import type { TaskUpdateChunk } from "@slack/types"
-import type { ToolPart } from "@opencode-ai/sdk"
-import type { SessionState } from "./types"
 import { DATA_DIR } from "./types"
-import { parseTodos } from "./todo"
 
-/** Build a TaskUpdateChunk from a tool part — returns null if no chunk needed */
-export function buildToolChunk(part: ToolPart, session: SessionState): TaskUpdateChunk | null {
-  const { seenTaskIds } = session
-  const taskId = part.id
-  const { state } = part
+export type ToolStatus = "in_progress" | "complete" | "error"
 
-  // Build human-readable titles from tool inputs — clearer than the raw
-  // `state.title` the SDK sets (which is often just the regex pattern or path).
-  let title: string = part.tool
-  if (part.tool === "read" && state.input.filePath) {
-    const rel_path = (state.input.filePath as string).replace(DATA_DIR, "")
-    title = `Reading ${rel_path}`
-  } else if (part.tool === "grep" && state.input.pattern) {
-    const pattern = state.input.pattern as string
-    const short = pattern.length > 40 ? pattern.slice(0, 40) + "…" : pattern
-    title = `Searching for "${short}"`
-  } else if (part.tool === "glob" && state.input.pattern) {
-    const pattern = state.input.pattern as string
-    const short = pattern.length > 40 ? pattern.slice(0, 40) + "…" : pattern
-    title = `Finding ${short}`
-  } else if ("title" in state && state.title) {
-    title = state.title
+export type ToolEvent = {
+  /** Tool call ID (stable across started/called/success/failed events). */
+  id: string
+  /** Tool name, e.g. `read`, `grep`, `shell`, or `mcp-clickhouse_run_select_query`. */
+  name: string
+  /** Parsed tool input once the model has finished emitting it. */
+  input?: Record<string, unknown>
+  status: ToolStatus
+  /** Optional streamed output shown under the task while it runs. */
+  output?: string
+}
+
+/** Build a human-readable task title from the tool name and its input. */
+export function toolTitle(name: string, input: Record<string, unknown> | undefined): string {
+  if (name === "read") {
+    const path = input?.filePath ?? input?.path
+    if (typeof path === "string") return `Reading ${path.replace(DATA_DIR, "")}`
+  } else if (name === "grep" && typeof input?.pattern === "string") {
+    const pattern = input.pattern
+    return `Searching for "${pattern.length > 40 ? pattern.slice(0, 40) + "…" : pattern}"`
+  } else if (name === "glob" && typeof input?.pattern === "string") {
+    const pattern = input.pattern
+    return `Finding ${pattern.length > 40 ? pattern.slice(0, 40) + "…" : pattern}`
+  } else if (name === "shell" && typeof input?.command === "string") {
+    const command = input.command
+    return `Running ${command.length > 60 ? command.slice(0, 60) + "…" : command}`
   }
+  return name
+}
 
-  if (state.status === "running") {
-    seenTaskIds.add(taskId)
-    let output: any
-    if (part.tool === "todowrite") {
-      const todos = parseTodos(state.input.todos)
-      if (todos.length > 0) {
-        session.todos = todos
-      }
-      return null
-    } else if (part.tool === "mcp-clickhouse_run_select_query") {
-      const query = part.state?.input?.query as string
-      output = `\`\`\`sql\n${query}\n\`\`\``
+/** Build a TaskUpdateChunk from a tool event — returns null if no chunk is needed. */
+export function buildToolChunk(tool: ToolEvent): TaskUpdateChunk | null {
+  const taskId = tool.id
+  const title = toolTitle(tool.name, tool.input)
+
+  if (tool.status === "in_progress") {
+    let output = tool.output
+    if (tool.name.endsWith("run_select_query") && typeof tool.input?.query === "string") {
+      output = `\`\`\`sql\n${tool.input.query}\n\`\`\``
     }
     return { type: "task_update", id: taskId, title, status: "in_progress", output }
-  } else if (state.status === "completed") {
-    return { type: "task_update", id: taskId, title, status: "complete" }
-  } else if (state.status === "error") {
-    return { type: "task_update", id: taskId, title, status: "error" }
   }
-
-  return null
+  if (tool.status === "complete") {
+    return { type: "task_update", id: taskId, title, status: "complete" }
+  }
+  return { type: "task_update", id: taskId, title, status: "error" }
 }

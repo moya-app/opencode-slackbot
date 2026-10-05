@@ -1,6 +1,6 @@
 import { App, Assistant } from "@slack/bolt"
 import type { AnyChunk } from "@slack/types"
-import { createOpencode } from "@opencode-ai/sdk"
+import { OpenCode } from "@opencode/sdk"
 import { randomUUID } from "node:crypto"
 import { readFile, unlink, writeFile } from "node:fs/promises"
 import { basename } from "node:path"
@@ -48,14 +48,18 @@ function isUnauthorized(userId: string | undefined, userTeamId: string | undefin
   return !!workspaceTeamId && !!userTeamId && userTeamId !== workspaceTeamId
 }
 
-console.log("Starting opencode server...")
-const opencode = await createOpencode({
-  port: 0,
+console.log("Starting opencode host...")
+// Embed OpenCode V2 in-process via `@opencode/sdk`. The host loads the on-disk
+// configuration (config/opencode.jsonc) and merges this inline config layer on
+// top of it.
+const opencode = await OpenCode.create({
   config: {
-    agent: {
-      // Replace OpenCode's built-in system prompt with our own instructions so that this and
-      // AGENTS.md is the sole source of system-level instructions.
-      build: { prompt: `
+    content: JSON.stringify({
+      agents: {
+        // Replace OpenCode's built-in system prompt with our own instructions so that this and
+        // AGENTS.md is the sole source of system-level instructions.
+        build: {
+          system: `
 You are a chatbot running on slack that answers questions for the user. Your chain-of-thought and tool cools are passed
 ephemerally to slack, and the final answer you give is what the user sees.
 
@@ -98,11 +102,13 @@ Example:
 </vega-lite>
 
 Do NOT generate charts when the data is a single number or a very simple answer that doesn't benefit from visualization.
-          ` },
-    },
+          `,
+        },
+      },
+    }),
   },
 })
-console.log("Opencode server ready")
+console.log("Opencode host ready")
 
 const store = new SessionStore()
 const restored = store.restore()
@@ -275,18 +281,17 @@ async function runPrompt(input: PromptInput): Promise<void> {
   let existingSession = store.get(sessionKey)
   if (!existingSession) {
     console.log("Creating new opencode session...")
-    const createResult = await opencode.client.session.create({
-      body: { title: `Slack thread ${threadTs}` },
-    })
-    if (createResult.error) {
-      console.error("Failed to create session:", createResult.error)
+    try {
+      const created = await opencode.session.create({ title: `Slack thread ${threadTs}` })
+      console.log("Created opencode session:", created.id)
+      existingSession = store.createSessionState(created.id, channel, threadTs, isChannel)
+      store.set(sessionKey, existingSession)
+      store.persistSession(sessionKey, existingSession)
+    } catch (error) {
+      console.error("Failed to create session:", error)
       await onError("Sorry, I had trouble creating a session. Please try again.")
       return
     }
-    console.log("Created opencode session:", createResult.data.id)
-    existingSession = store.createSessionState(createResult.data.id, channel, threadTs, isChannel)
-    store.set(sessionKey, existingSession)
-    store.persistSession(sessionKey, existingSession)
   }
 
   const session = existingSession
@@ -307,10 +312,8 @@ async function runPrompt(input: PromptInput): Promise<void> {
   })
 
   session.streamer = streamer
-  session.seenTaskIds = new Set()
-  session.textPartStates = new Map()
-  session.textPartToMessageID = new Map()
-  session.messagePartOrder = new Map()
+  session.toolNames = new Map()
+  session.textByMessage = new Map()
   session.messageFinishByID = new Map()
   session.publishedMessageIDs = new Set()
   session.thinkingMessageIDs = new Set()
@@ -333,15 +336,14 @@ async function runPrompt(input: PromptInput): Promise<void> {
     textForOpencode += `\n\nAttached files are available at:\n${otherFiles.map(f => `- ${f.path}`).join("\n")}`
   }
 
-  // Build prompt parts: text first, then image file parts, then CSV tables as file parts
-  const parts: Array<{ type: "text"; text: string } | { type: "file"; mime: string; url: string; filename?: string }> = [
-    { type: "text", text: textForOpencode },
-  ]
+  // V2 prompt: a single text string plus optional file attachments. Images and
+  // pasted tables are sent as data URIs.
+  const promptFiles: Array<{ uri: string; name?: string }> = []
   for (const img of imageFiles) {
     try {
       const data = await readFile(img.path)
       const dataUri = `data:${img.mime};base64,${data.toString("base64")}`
-      parts.push({ type: "file", mime: img.mime, url: dataUri, filename: img.name })
+      promptFiles.push({ uri: dataUri, name: img.name })
     } catch (error) {
       console.error(`Failed to read image ${img.path} for file part:`, error)
     }
@@ -349,26 +351,25 @@ async function runPrompt(input: PromptInput): Promise<void> {
   for (const [i, csv] of tableTexts.entries()) {
     const filename = tableTexts.length > 1 ? `table-${i + 1}.csv` : `table.csv`
     const dataUri = `data:text/plain;base64,${Buffer.from(csv).toString("base64")}`
-    parts.push({ type: "file", mime: "text/plain", url: dataUri, filename })
+    promptFiles.push({ uri: dataUri, name: filename })
   }
 
-  console.log(`Sending to opencode: ${parts.length} part(s), text=${textForOpencode.length} chars, images=${imageFiles.length}`)
-  let result: Awaited<ReturnType<typeof opencode.client.session.prompt>> | null = null
+  console.log(`Sending to opencode: text=${textForOpencode.length} chars, images=${imageFiles.length}, files=${promptFiles.length}`)
+  let promptError: unknown = null
   try {
-    result = await opencode.client.session.prompt({
-      path: { id: session.sessionId },
-      body: { parts },
+    await opencode.session.prompt({
+      sessionID: session.sessionId,
+      text: textForOpencode,
+      files: promptFiles.length > 0 ? promptFiles : undefined,
     })
   } catch (error) {
     console.error("Prompt failed:", error)
+    promptError = error
   } finally {
     await cleanupAttachments(stagedFiles)
   }
-  console.log("Opencode completed")
+  console.log("Opencode prompt accepted")
 
-  const promptError = !result
-    ? new Error("Prompt request failed before receiving a response")
-    : ("error" in result ? result.error : undefined)
   if (promptError) {
     console.error("Prompt failed:", promptError)
     store.activeRuns.delete(sessionKey)

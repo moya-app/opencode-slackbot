@@ -128,23 +128,33 @@ export async function postAssistantResponse(client: SlackClient, session: Sessio
   return true
 }
 
-function registerTextPart(session: SessionState, messageID: string, partID: string): void {
-  session.textPartToMessageID.set(partID, messageID)
-  const existing = session.messagePartOrder.get(messageID)
-  if (existing) {
-    if (!existing.includes(partID)) existing.push(partID)
-    return
+/** Store the authoritative text for one text part (message + ordinal). */
+export function setTextPart(session: SessionState, messageID: string, ordinal: number, text: string): void {
+  let parts = session.textByMessage.get(messageID)
+  if (!parts) {
+    parts = new Map()
+    session.textByMessage.set(messageID, parts)
   }
-  session.messagePartOrder.set(messageID, [partID])
+  parts.set(ordinal, text)
 }
 
-export { registerTextPart }
+/** Append a streaming delta to a text part. */
+export function appendTextPart(session: SessionState, messageID: string, ordinal: number, delta: string): void {
+  let parts = session.textByMessage.get(messageID)
+  if (!parts) {
+    parts = new Map()
+    session.textByMessage.set(messageID, parts)
+  }
+  parts.set(ordinal, (parts.get(ordinal) ?? "") + delta)
+}
 
 export function buildMessageText(session: SessionState, messageID: string): string {
-  const partIDs = session.messagePartOrder.get(messageID) ?? []
+  const parts = session.textByMessage.get(messageID)
+  if (!parts) return ""
+  const ordinals = [...parts.keys()].sort((a, b) => a - b)
   const pieces: string[] = []
-  for (const partID of partIDs) {
-    const text = session.textPartStates.get(partID)
+  for (const ordinal of ordinals) {
+    const text = parts.get(ordinal)
     if (typeof text === "string" && text.trim().length > 0) {
       pieces.push(text.trim())
     }
@@ -158,6 +168,7 @@ export async function tryPublishFinalMessage(client: SlackClient, session: Sessi
   if (finish !== "stop") return false
 
   const text = buildMessageText(session, messageID)
+  if (!text) return false
   const posted = await postAssistantResponse(client, session, text)
   if (posted) {
     session.publishedMessageIDs.add(messageID)
@@ -177,14 +188,13 @@ export async function publishPendingFinalMessages(client: SlackClient, session: 
 
   if (published) return true
 
+  // Fallback: the model often does the real work in a step that ends with
+  // `tool-calls` while the final `stop` step is empty. Publish the longest
+  // un-published assistant message we saw instead.
   let fallbackMessageID = ""
   let fallbackLength = 0
-  for (const [messageID] of session.messagePartOrder.entries()) {
+  for (const messageID of session.assistantMessageIDs) {
     if (session.publishedMessageIDs.has(messageID)) continue
-    // Bug 2 fix: skip non-assistant messages (e.g. user prompts) in fallback
-    if (!session.assistantMessageIDs.has(messageID)) continue
-    // Include tool-calls messages: the model often puts its text in the message
-    // that finishes with "tool-calls" while the final "stop" message is empty.
     const text = buildMessageText(session, messageID)
     if (text.length > fallbackLength) {
       fallbackLength = text.length
@@ -201,17 +211,4 @@ export async function publishPendingFinalMessages(client: SlackClient, session: 
   }
 
   return false
-}
-
-/** Remove any text-part state registered for a given messageID.
- *  Used when we discover a message is not from the assistant (Bug 2 fix). */
-export function clearTextPartsForMessage(session: SessionState, messageID: string): void {
-  const partIDs = session.messagePartOrder.get(messageID)
-  if (partIDs) {
-    for (const partID of partIDs) {
-      session.textPartStates.delete(partID)
-      session.textPartToMessageID.delete(partID)
-    }
-    session.messagePartOrder.delete(messageID)
-  }
 }
