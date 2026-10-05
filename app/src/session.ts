@@ -49,6 +49,7 @@ export class SessionStore {
       assistantMessageIDs: new Set(),
       lastModelID: "",
       usage: emptyUsage(),
+      lastError: "",
     }
   }
 
@@ -108,6 +109,7 @@ export class SessionStore {
     session.assistantMessageIDs = new Set()
     // `lastModelID` and `usage` are session-level (not per-run) and are kept so
     // the cost/model summary persists across turns of the same thread.
+    session.lastError = ""
     // streamer is nulled by the event loop after stopping; reset here defensively
     session.streamer = null
   }

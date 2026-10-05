@@ -56,10 +56,13 @@ tool/task updates and final responses back into Slack threads.
     the Slack thread.
 
 - `src/events.ts`
-  - `startEventLoop`: subscribes to the OpenCode V2 event stream and processes events in batched 350 ms flush windows.
+  - `startEventLoop`: subscribes to the OpenCode V2 event stream and processes events in batched 1 s flush windows
+    (chosen to stay under Slack's `chat.appendStream` Tier 4 rate limit).
   - Handles the V2 events: `session.text.started/delta/ended`, `session.reasoning.started/delta`,
     `session.step.started/ended/failed`, `session.tool.input.started`, `session.tool.called/success/failed`,
-    `session.usage.updated`, `session.execution.failed`, and `session.idle`.
+    `session.usage.updated`, `session.execution.succeeded/failed/interrupted`, and `session.idle`.
+  - Structured errors (`session.step.failed` / `session.execution.failed`) are captured on the session and always
+    posted back to the Slack thread via `postAssistantResponse`, so failures are never silent.
 
 - `package.json`
   - Runtime scripts:
@@ -87,12 +90,15 @@ tool/task updates and final responses back into Slack threads.
 6. Send the prompt to OpenCode via `session.prompt({ sessionID, text, files })` (images and pasted tables are sent as
    data-URI attachments). The call returns as soon as the input is admitted; output arrives asynchronously via events.
 7. The event loop receives `session.text.delta` / `session.reasoning.delta` events, batches thinking/tool chunks, and
-   flushes them to `streamer` every 350 ms.
+   flushes them to `streamer` every 1 s.
 8. `session.tool.*` events create/complete the tool tasks shown in the plan pane; `todowrite` no longer exists in V2.
 9. `session.step.ended` records the finish reason and completes the message's thinking task. A `stop` step publishes the
    final response via `postAssistantResponse` (a proper `chat.postMessage` with cost info and feedback buttons).
-10. On `session.idle`, remaining pending chunks are flushed, any un-published final message is posted, the working task
-    is completed, and the stream is stopped.
+10. On `session.idle` (or `session.execution.succeeded/failed/interrupted`, whichever arrives first), remaining pending
+    chunks are flushed, any un-published final message is posted, the working task is completed, and the stream is
+    stopped.
+11. If the run failed, the structured error is posted to the thread (and shown in the plan pane) so the user sees what
+    went wrong instead of a silent stop.
 
 ## Session State
 
@@ -113,7 +119,7 @@ Each thread session (`SessionState`) tracks:
 
 - Keep assistant, mention, and DM handlers aligned by extending `runPrompt` rather than duplicating logic.
 - Add new tool-specific rendering inside `buildToolChunk` in `src/tools.ts`.
-- The event loop batches chunks over 350 ms windows — keep flush logic inside `flushEntry` in `src/events.ts`.
+- The event loop batches chunks over 1 s windows — keep flush logic inside `flushEntry` in `src/events.ts`.
 - `isChannel: true` is set for `app_mention` events; `postAssistantResponse` uses `reply_broadcast: true` in that case
   so the final reply surfaces in the channel.
 - Feedback deduplication is handled by `SessionStore.feedbackGiven` — the first click updates the original message in

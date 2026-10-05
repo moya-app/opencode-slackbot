@@ -11,7 +11,7 @@ import type { PromptInput, SlackClient } from "./types"
 import type { IncomingAttachment } from "./types"
 import { SessionStore } from "./session"
 import { startEventLoop } from "./events"
-import { safeStreamAction } from "./slack"
+import { safeStreamAction, postAssistantResponse } from "./slack"
 import { settings, blockedUsers, isBlockedUser } from "./settings"
 
 chdir(DATA_DIR)
@@ -372,13 +372,21 @@ async function runPrompt(input: PromptInput): Promise<void> {
   if (promptError) {
     console.error("Prompt failed:", promptError)
     store.activeRuns.delete(sessionKey)
+    const detail = promptError instanceof Error ? promptError.message.trim() : String(promptError).trim()
+    const message = detail
+      ? `:warning: Sorry, I couldn't send that request: ${detail}`
+      : ":warning: Sorry, something went wrong. Please try again."
     await safeStreamAction(client, session, () => session.streamer!.append({
       chunks: [{ type: "task_update", id: workingTaskId, title: "Working on your request", status: "error" }],
     }))
     await safeStreamAction(client, session, () => session.streamer!.stop({
-      chunks: [{ type: "markdown_text", text: "Sorry, something went wrong. Please try again." } as AnyChunk],
+      chunks: [{ type: "markdown_text", text: message } as AnyChunk],
     }))
     session.streamer = null
+    // Post separately too, so the error is still visible if the stream expired.
+    await postAssistantResponse(client, session, message).catch((e) => {
+      console.error("Failed to post prompt error to Slack:", e)
+    })
     return
   }
 }
