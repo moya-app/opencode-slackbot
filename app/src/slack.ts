@@ -1,5 +1,6 @@
 import type { SessionState, SlackClient } from "./types"
 import { extractVegaLiteSpecs, renderAndUploadCharts } from "./chart"
+import { extractSlackFiles, uploadSlackFiles } from "./files"
 import { settings } from "./settings"
 
 // Feedback block appended to every completed response
@@ -59,13 +60,18 @@ export async function postResponseMeta(client: SlackClient, session: SessionStat
 }
 
 export async function postAssistantResponse(client: SlackClient, session: SessionState, text: string): Promise<boolean> {
-  // Extract any <vega-lite> chart specs before posting text
+  // Extract any <vega-lite> chart specs and <slack-file> directives before posting text
   const hasVegaTag = text.includes("<vega-lite>")
-  const { cleanedText: trimmed, charts } = extractVegaLiteSpecs(text.trim())
+  const { cleanedText: chartCleaned, charts } = extractVegaLiteSpecs(text.trim())
+  const { cleanedText, files: extractedFiles } = extractSlackFiles(chartCleaned)
+  // Always strip directives, but only act on them when the feature is enabled.
+  const files = settings.SEND_FILE_MAX_SIZE > 0 ? extractedFiles : []
   if (hasVegaTag) {
-    console.log(`postAssistantResponse: found <vega-lite> tag, extracted ${charts.length} chart(s), cleaned text length: ${trimmed.length}`)
+    console.log(`postAssistantResponse: found <vega-lite> tag, extracted ${charts.length} chart(s), cleaned text length: ${cleanedText.length}`)
   }
-  if (!trimmed && charts.length === 0) return false
+  // A response that is only a file directive still needs to be posted/uploaded.
+  const trimmed = cleanedText || (files.length > 0 ? "Here is the file you requested." : "")
+  if (!trimmed && charts.length === 0 && files.length === 0) return false
 
   if (trimmed.length > 12000) {
     try {
@@ -81,6 +87,7 @@ export async function postAssistantResponse(client: SlackClient, session: Sessio
       if (charts.length > 0) {
         await renderAndUploadCharts(client, session, charts)
       }
+      await uploadSlackFiles(client, session, files)
       return true
     } catch (e) {
       console.error("Failed to upload large response as file, falling back to chunked messages:", e)
@@ -111,7 +118,7 @@ export async function postAssistantResponse(client: SlackClient, session: Sessio
     await client.chat.postMessage({
       channel: session.channel,
       thread_ts: session.thread,
-      text: chunks[0] || "See chart below.",
+      text: chunks[0] || (files.length > 0 ? "Here is the file you requested." : "See chart below."),
       blocks,
       reply_broadcast: session.isChannel && settings.REPLY_BROADCAST,
     })
@@ -124,6 +131,9 @@ export async function postAssistantResponse(client: SlackClient, session: Sessio
   if (charts.length > 0) {
     await renderAndUploadCharts(client, session, charts)
   }
+
+  // Upload any files the agent asked to send back
+  await uploadSlackFiles(client, session, files)
 
   return true
 }
@@ -261,36 +271,37 @@ async function finalizeExpiredStream(client: SlackClient, channel: string, ts: s
   }
 }
 
+/** Outcome of a stream action, so callers can decide whether a retry is useful. */
+export type StreamActionResult = "ok" | "expired" | "rate_limited" | "failed"
+
 /**
  * Run an append/stop against the session stream and never throw into the event
  * loop. If Slack has already finalised the stream, disable further live updates
  * and clean up the message instead.
- *
- * Returns true if the action succeeded.
  */
 export async function safeStreamAction(
   client: SlackClient,
   session: SessionState,
   action: () => Promise<unknown>,
-): Promise<boolean> {
-  if (!session.streamer) return false
+): Promise<StreamActionResult> {
+  if (!session.streamer) return "expired"
   try {
     await action()
-    return true
+    return "ok"
   } catch (error) {
     if (isStreamExpiredError(error)) {
       console.error("Slack stream is no longer in a streaming state; disabling live updates:", error)
       const ts = session.streamer?.ts
       session.streamer = null
       await finalizeExpiredStream(client, session.channel, ts)
-      return false
+      return "expired"
     }
     if (isRateLimitError(error)) {
-      // Avoid hammering: this update is dropped and the next flush will retry.
+      // Transient: the caller can re-queue this update for the next flush.
       console.error("Slack rate limit hit while updating the stream; dropping this update:", error)
-      return false
+      return "rate_limited"
     }
     console.error("Failed to update the Slack stream:", error)
-    return false
+    return "failed"
   }
 }

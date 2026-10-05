@@ -3,11 +3,12 @@ import type { AnyChunk } from "@slack/types"
 import { OpenCode } from "@opencode/client"
 import { Service } from "@opencode/client/service"
 import { randomUUID } from "node:crypto"
-import { readFile, unlink, writeFile } from "node:fs/promises"
-import { basename } from "node:path"
+import { mkdir, readdir, rm, stat, writeFile } from "node:fs/promises"
+import { basename, join } from "node:path"
 import { chdir } from "node:process"
 
 import { DATA_DIR } from "./types"
+import { STAGING_ROOT, stagingDirFor } from "./paths"
 import type { PromptInput, SlackClient } from "./types"
 import type { IncomingAttachment } from "./types"
 import { SessionStore } from "./session"
@@ -99,6 +100,45 @@ Example:
 Do NOT generate charts when the data is a single number or a very simple answer that doesn't benefit from visualization.
 `
 
+/**
+ * The session-scoped part of the system prompt. OpenCode V2 assembles instructions
+ * from several sources; API-managed entries are appended after the agent system
+ * prompt and AGENTS.md. We register this once per session (at session begin) so
+ * the scratch directory is in the system prompt rather than repeated before every
+ * message round.
+ */
+function buildSessionInstructions(scratchDir: string): string {
+  let text = `
+# Session scratch directory
+
+Your session scratch directory is:
+
+${scratchDir}
+
+Write large command output there (eg piped from a shell command) instead of returning it inline. That directory is the
+only location outside the workspace you are allowed to write to; do not attempt to write anywhere else (such as
+\`/tmp\` directly).
+`
+
+  // Only teach the agent to send files when the feature is enabled.
+  if (settings.SEND_FILE_MAX_SIZE > 0) {
+    text += `
+To send a file back to the user in Slack, write it into your session scratch directory and then include a directive in
+your final answer:
+
+<slack-file>
+{"path": "<absolute path inside your session scratch directory>", "title": "Optional title", "comment": "Optional message posted with the file"}
+</slack-file>
+
+The harness uploads the file to the Slack thread and removes the directive from your answer. Use the exact absolute
+path and keep the file inside the session scratch directory; any path outside it is rejected. Use one directive per
+file. You do not need to post the file contents inline.
+`
+  }
+
+  return text
+}
+
 console.log("Starting opencode service...")
 const endpoint = await Service.ensure({
   // Highest-priority inline config layer: replace OpenCode's built-in system
@@ -118,6 +158,13 @@ console.log(`Restored ${restored} session(s) from database`)
 startEventLoop(opencode, app.client, store)
 
 // ─── Shared prompt logic ──────────────────────────────────────────
+
+/**
+ * Per-thread run queue. Each prompt appends a link to its thread's chain and
+ * waits for the previous one, so terminal OpenCode events from an older run can
+ * never be mistaken for the current one.
+ */
+const runQueue = new Map<string, Promise<void>>()
 
 function sanitizeFileName(name: string): string {
   const base = basename(name)
@@ -166,27 +213,141 @@ function extractTablesFromAttachments(attachments: any[] | undefined): string[] 
   return tables
 }
 
-const IMAGE_MIMES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp", "image/svg+xml"])
+type StagedFile = { path: string }
 
-function mimeFromFile(file: IncomingAttachment): string {
-  if (file.mimetype) return file.mimetype
-  const ext = (file.name || "").split(".").pop()?.toLowerCase()
-  const map: Record<string, string> = {
-    png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif",
-    webp: "image/webp", svg: "image/svg+xml", pdf: "application/pdf",
-    csv: "text/csv", txt: "text/plain", json: "application/json",
+/** How long an idle session's staged files are kept before being swept. */
+const STAGING_TTL_MS = 24 * 60 * 60 * 1000
+
+/**
+ * Remove staged uploads older than `STAGING_TTL_MS`, and any session directory
+ * left empty. Uploads are not deleted when a run ends because the agent may
+ * `read` only part of a file, or re-read it in a later turn, so we cannot know
+ * when it is done.
+ */
+async function sweepStaleStaging(): Promise<void> {
+  let sessions
+  try {
+    sessions = await readdir(STAGING_ROOT, { withFileTypes: true })
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code !== "ENOENT") {
+      console.error("Failed to scan attachment staging root:", error)
+    }
+    return
   }
-  return (ext && map[ext]) || "application/octet-stream"
+
+  const cutoff = Date.now() - STAGING_TTL_MS
+  for (const session of sessions) {
+    if (!session.isDirectory()) continue
+    const dir = join(STAGING_ROOT, session.name)
+
+    let files
+    try {
+      files = await readdir(dir, { withFileTypes: true })
+    } catch (error) {
+      console.error(`Failed to scan staging directory ${dir}:`, error)
+      continue
+    }
+
+    let remaining = 0
+    for (const file of files) {
+      const path = join(dir, file.name)
+      try {
+        const info = await stat(path)
+        if (info.mtimeMs < cutoff) {
+          await rm(path, { recursive: true, force: true })
+          console.log(`Removed stale staged upload ${path}`)
+        } else {
+          remaining++
+        }
+      } catch (error) {
+        console.error(`Failed to sweep staged upload ${path}:`, error)
+      }
+    }
+
+    if (remaining === 0) {
+      try {
+        await rm(dir, { recursive: true, force: true })
+      } catch (error) {
+        console.error(`Failed to remove empty staging directory ${dir}:`, error)
+      }
+    }
+  }
 }
 
-type StagedFile = { path: string; name: string; mime: string }
+/**
+ * No matter what user permissions there were, allow session's external-directory access to its own staging directory.
+ */
+function sessionPermissions(sessionId: string) {
+  const dir = stagingDirFor(sessionId)
+  return [
+    { action: "external_directory", resource: dir, effect: "allow" as const },
+    { action: "external_directory", resource: `${dir}/**`, effect: "allow" as const },
+  ]
+}
 
-async function stageAttachments(files: IncomingAttachment[] | undefined, client: SlackClient): Promise<StagedFile[]> {
+/** Sessions whose per-session permissions have already been applied this process. */
+const permissionsConfigured = new Set<string>()
+
+async function ensureSessionPermissions(sessionId: string): Promise<void> {
+  if (permissionsConfigured.has(sessionId)) return
+  try {
+    await opencode.session.update({ sessionID: sessionId, permissions: sessionPermissions(sessionId) })
+    permissionsConfigured.add(sessionId)
+  } catch (error) {
+    // Non-fatal for the rest of the bot, but note the global config denies
+    // external_directory (*), so without this allow entry the agent cannot
+    // read or write its own scratch directory.
+    console.error(`Failed to restrict external access for session ${sessionId}:`, error)
+  }
+}
+
+/** Sessions whose per-session system instructions have already been registered this process. */
+const instructionsConfigured = new Set<string>()
+
+/**
+ * Attach the session's scratch directory to its system prompt through OpenCode's
+ * session-scoped instruction entries (the V2 replacement for the old per-prompt
+ * `system` field). This is set once per session at session begin; changes apply
+ * at the next step boundary and persist for the life of the session, so it is
+ * no longer repeated before every message.
+ */
+async function ensureSessionInstructions(sessionId: string, scratchDir: string): Promise<void> {
+  if (instructionsConfigured.has(sessionId)) return
+  try {
+    await opencode.session.instructions.entry.put({
+      sessionID: sessionId,
+      key: "slack.session",
+      value: buildSessionInstructions(scratchDir),
+    })
+    instructionsConfigured.add(sessionId)
+  } catch (error) {
+    // Non-fatal: the agent just won't be told its scratch directory.
+    console.error(`Failed to set session instructions for ${sessionId}:`, error)
+  }
+}
+
+/**
+ * Download Slack uploads into the session's staging directory. Files are kept
+ * on disk (and swept by TTL) so the agent can read them — fully, partially, or
+ * again in a later turn — with the `read` tool.
+ */
+async function stageAttachments(
+  files: IncomingAttachment[] | undefined,
+  client: SlackClient,
+  dir: string,
+): Promise<StagedFile[]> {
   if (!files?.length) return []
 
   const token = settings.SLACK_BOT_TOKEN
   if (!token) {
     console.error("Cannot download attachments: SLACK_BOT_TOKEN is not set")
+    return []
+  }
+
+  try {
+    await mkdir(dir, { recursive: true })
+  } catch (error) {
+    console.error(`Failed to create attachment staging directory ${dir}:`, error)
     return []
   }
 
@@ -231,28 +392,17 @@ async function stageAttachments(files: IncomingAttachment[] | undefined, client:
       }
 
       const safeName = sanitizeFileName(file.name || `attachment-${staged.length + 1}`)
-      const path = `/tmp/${randomUUID()}-${safeName}`
+      const path = join(dir, `${randomUUID()}-${safeName}`)
       const content = Buffer.from(await response.arrayBuffer())
       await writeFile(path, content)
-      const mime = mimeFromFile(file)
-      console.log(`Staged "${file.name}" -> ${path} (${content.length} bytes, ${mime})`)
-      staged.push({ path, name: safeName, mime })
+      console.log(`Staged "${file.name}" -> ${path} (${content.length} bytes)`)
+      staged.push({ path })
     } catch (error) {
       console.error(`Failed to stage "${file.name}":`, error)
     }
   }
 
   return staged
-}
-
-async function cleanupAttachments(staged: StagedFile[]): Promise<void> {
-  await Promise.all(staged.map(async ({ path }) => {
-    try {
-      await unlink(path)
-    } catch (error) {
-      console.error(`Failed to remove attachment ${path}:`, error)
-    }
-  }))
 }
 
 async function runPrompt(input: PromptInput): Promise<void> {
@@ -278,6 +428,22 @@ async function runPrompt(input: PromptInput): Promise<void> {
 
   const sessionKey = `${channel}-${threadTs}`
 
+  // Slack handlers run concurrently and OpenCode terminal events are matched by
+  // session, so two prompts in the same thread would clobber each other's
+  // streamer/state (the older run's terminal event would finalize the newer
+  // run). Chain runs per thread so each prompt waits for the previous one.
+  const priorLink = runQueue.get(sessionKey) ?? Promise.resolve()
+  let resolveDone!: () => void
+  const done = new Promise<void>((resolve) => { resolveDone = resolve })
+  const link = priorLink.then(() => done)
+  runQueue.set(sessionKey, link)
+  // Drop the queue entry once this link settles and no newer prompt is waiting,
+  // so the map does not grow with every thread the bot has ever seen.
+  void link.finally(() => {
+    if (runQueue.get(sessionKey) === link) runQueue.delete(sessionKey)
+  })
+  await priorLink
+
   let existingSession = store.get(sessionKey)
   if (!existingSession) {
     console.log("Creating new opencode session...")
@@ -295,11 +461,33 @@ async function runPrompt(input: PromptInput): Promise<void> {
     } catch (error) {
       console.error("Failed to create session:", error)
       await onError("Sorry, I had trouble creating a session. Please try again.")
+      resolveDone()
       return
     }
   }
 
   const session = existingSession
+
+  // Restrict this session to its own scratch directory before it runs.
+  await ensureSessionPermissions(session.sessionId)
+  const stagedDir = stagingDirFor(session.sessionId)
+
+  // Create the scratch directory even when there are no uploads, so the agent
+  // can redirect command output (e.g. clickhouse-client query results) here.
+  try {
+    await mkdir(stagedDir, { recursive: true })
+  } catch (error) {
+    console.error(`Failed to create session scratch directory ${stagedDir}:`, error)
+  }
+
+  // Tell the session where its scratch directory is, as session-scoped system
+  // instructions, so it is part of the system prompt rather than repeated on
+  // every message round.
+  await ensureSessionInstructions(session.sessionId, stagedDir)
+
+  // Reset per-run state (this also clears any stale lastError). Session-level
+  // usage/model are intentionally preserved.
+  store.resetRunState(session)
 
   const streamer = client.chatStream({
     channel,
@@ -310,54 +498,38 @@ async function runPrompt(input: PromptInput): Promise<void> {
   })
 
   session.streamer = streamer
-  session.toolNames = new Map()
-  session.textByMessage = new Map()
-  session.messageFinishByID = new Map()
-  session.publishedMessageIDs = new Set()
-  session.thinkingMessageIDs = new Set()
-  session.assistantMessageIDs = new Set()
 
   const workingTaskId = `working-${Date.now()}`
   await safeStreamAction(client, session, () => session.streamer!.append({
     chunks: [{ type: "task_update", id: workingTaskId, title: "Working on your request", status: "in_progress" }],
   }))
 
-  store.activeRuns.set(sessionKey, { workingTaskId, textStreamed: false })
+  // Register the run before staging so the next prompt has something to await
+  // and finalizeSession can release the slot.
+  store.activeRuns.set(sessionKey, { workingTaskId, resolveDone, done })
 
-  const stagedFiles = await stageAttachments(files, client)
+  const stagedFiles = await stageAttachments(files, client, stagedDir)
   if (files?.length && stagedFiles.length === 0) {
     console.warn("stageAttachments: all files failed to stage")
   }
 
-  // Split staged files into images (sent as file parts) and others (paths in text)
-  const imageFiles = stagedFiles.filter(f => IMAGE_MIMES.has(f.mime))
-  const otherFiles = stagedFiles.filter(f => !IMAGE_MIMES.has(f.mime))
-
   const promptText = text.trim() || "User attached one or more files or tables. Please review the attached data."
   let textForOpencode = promptText
-  if (otherFiles.length) {
-    textForOpencode += `\n\nAttached files are available at:\n${otherFiles.map(f => `- ${f.path}`).join("\n")}`
+  if (stagedFiles.length) {
+    textForOpencode += `\n\nAttached files are available at (read them from disk):\n${stagedFiles.map(f => `- ${f.path}`).join("\n")}`
   }
 
-  // V2 prompt: a single text string plus optional file attachments. Images and
-  // pasted tables are sent as data URIs.
+  // V2 prompt: a single text string plus optional file attachments. Pasted
+  // tables (inline data, not uploads) are still sent as data URIs; uploaded
+  // files are referenced by path above and read by the agent itself.
   const promptFiles: Array<{ uri: string; name?: string }> = []
-  for (const img of imageFiles) {
-    try {
-      const data = await readFile(img.path)
-      const dataUri = `data:${img.mime};base64,${data.toString("base64")}`
-      promptFiles.push({ uri: dataUri, name: img.name })
-    } catch (error) {
-      console.error(`Failed to read image ${img.path} for file part:`, error)
-    }
-  }
   for (const [i, csv] of tableTexts.entries()) {
-    const filename = tableTexts.length > 1 ? `table-${i + 1}.csv` : `table.csv`
+    const filename = tableTexts.length > 1 ? `table-${i + 1}.csv` : "table.csv"
     const dataUri = `data:text/plain;base64,${Buffer.from(csv).toString("base64")}`
     promptFiles.push({ uri: dataUri, name: filename })
   }
 
-  console.log(`Sending to opencode: text=${textForOpencode.length} chars, images=${imageFiles.length}, files=${promptFiles.length}`)
+  console.log(`Sending to opencode: text=${textForOpencode.length} chars, uploads=${stagedFiles.length}, tables=${tableTexts.length}`)
   let promptError: unknown = null
   try {
     await opencode.session.prompt({
@@ -368,29 +540,29 @@ async function runPrompt(input: PromptInput): Promise<void> {
   } catch (error) {
     console.error("Prompt failed:", error)
     promptError = error
-  } finally {
-    await cleanupAttachments(stagedFiles)
   }
   console.log("Opencode prompt accepted")
 
   if (promptError) {
     console.error("Prompt failed:", promptError)
-    store.activeRuns.delete(sessionKey)
     const detail = promptError instanceof Error ? promptError.message.trim() : String(promptError).trim()
     const message = detail
       ? `:warning: Sorry, I couldn't send that request: ${detail}`
       : ":warning: Sorry, something went wrong. Please try again."
     await safeStreamAction(client, session, () => session.streamer!.append({
-      chunks: [{ type: "task_update", id: workingTaskId, title: "Working on your request", status: "error" }],
+      chunks: [{ type: "task_update", id: workingTaskId, title: "Working on your request", status: "complete" }],
     }))
     await safeStreamAction(client, session, () => session.streamer!.stop({
       chunks: [{ type: "markdown_text", text: message } as AnyChunk],
     }))
-    session.streamer = null
     // Post separately too, so the error is still visible if the stream expired.
     await postAssistantResponse(client, session, message).catch((e) => {
       console.error("Failed to post prompt error to Slack:", e)
     })
+    const failedRun = store.activeRuns.get(sessionKey)
+    store.activeRuns.delete(sessionKey)
+    store.resetRunState(session)
+    failedRun?.resolveDone()
     return
   }
 }
@@ -614,6 +786,10 @@ app.action("feedback", async ({ ack, body, client }) => {
 })
 
 // ─── Start ────────────────────────────────────────────────────────
+
+// Sweep stale upload directories now and hourly.
+void sweepStaleStaging()
+setInterval(() => { void sweepStaleStaging() }, 60 * 60 * 1000)
 
 await app.start()
 try {
