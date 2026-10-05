@@ -8,7 +8,7 @@
     "typecheck": "tsgo --noEmit"
   },
   "dependencies": {
-    "@opencode/sdk": "^2.0.23",
+    "@opencode/client": "^2.0.23",
     "@resvg/resvg-js": "^2.6.2",
     "@slack/bolt": "4.6.0",
     "vega": "^6.2.0",

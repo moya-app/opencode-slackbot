@@ -1,5 +1,5 @@
 import type { AnyChunk } from "@slack/types"
-import type { OpenCodeEvent } from "@opencode/sdk"
+import type { OpenCodeEvent } from "@opencode/client"
 import type { SlackClient, SessionState } from "./types"
 import type { SessionStore } from "./session"
 import { buildToolChunk, clampTaskTextTail } from "./tools"
@@ -12,9 +12,9 @@ import { appendTextPart, setTextPart, tryPublishFinalMessage, publishPendingFina
  */
 const FLUSH_INTERVAL_MS = 1000
 
-/** Minimal structural type for the embedded OpenCode host — avoids a hard import. */
+/** Minimal structural type for the OpenCode client — avoids a hard import. */
 type EventSource = {
-  events: { subscribe: (options?: { signal?: AbortSignal }) => AsyncIterable<OpenCodeEvent> }
+  event: { subscribe: (options?: { signal?: AbortSignal }) => AsyncIterable<OpenCodeEvent> }
 }
 
 type PendingEntry = {
@@ -203,7 +203,7 @@ export async function startEventLoop(
     store.resetRunState(session)
   }
 
-  for await (const event of opencode.events.subscribe()) {
+  for await (const event of opencode.event.subscribe()) {
     switch (event.type) {
       // ── Text output ──────────────────────────────────────────────
       case "session.text.started": {

@@ -149,24 +149,29 @@ SLACK_SIGNING_SECRET=your-signing-secret-here
 
 # Other configuration notes
 
-The default `docker-compose.yml` mounts three directories:
+The default `docker-compose.yml` mounts:
 
 1. `config/` — opencode configuration file (`opencode.jsonc`)
 2. `data/` — files exposed to the bot (`AGENTS.md`, markdown, CSVs, etc.)
-3. `sessions/` — opencode and slackbot session storage. Persisted across container restarts so the bot remembers
-   previous conversations and context.
+3. `session_data` — a Docker **named volume** (not a host directory), mounted at `/root/.local/share/opencode`.
+   It holds `opencode.db` (OpenCode sessions) and `slack-sessions.db` (the Slack thread → OpenCode session mapping),
+   and is persisted across container restarts so the bot remembers previous conversations and context.
 
 # Debug Opencode
 
-The bot embeds the OpenCode V2 server in-process via `@opencode/sdk`, so there is no HTTP port to attach to. OpenCode
-logs are written to the container's stdout/stderr alongside the bot's own logs:
+The bot connects to the shared OpenCode service, which runs as a separate process in the container (the bot starts it
+on boot via `@opencode/client`'s `Service.ensure()`, which runs `opencode serve --service`). Because it is the shared
+service, the TUI and the API attach to the exact same server the bot is using:
 
-    docker compose logs -f opencode
+    docker compose exec opencode bash -c 'cd data && opencode'   # interactive TUI in the bot's workspace
+    docker compose exec opencode opencode api get /api/info
+    docker compose exec opencode opencode api get /api/session
 
-To inspect or debug the configuration interactively, run the OpenCode CLI in the data directory (this starts a separate
-standalone server for the terminal session):
+**Session lists are project-scoped.** The bot creates its sessions in `/app/data`, so `opencode session list` (and the
+TUI session picker) only shows them when run from that directory. Run the TUI from `/app` and it will look empty — use
+the `cd data` form above, or `opencode api get /api/session`, which lists across locations.
 
-    docker compose exec opencode bash -c 'cd data; opencode'
+OpenCode server logs are written to `/root/.local/share/opencode/log/opencode.log` (inside the `session_data` volume).
 
 # Local Development
 

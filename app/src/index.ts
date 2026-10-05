@@ -1,6 +1,7 @@
 import { App, Assistant } from "@slack/bolt"
 import type { AnyChunk } from "@slack/types"
-import { OpenCode } from "@opencode/sdk"
+import { OpenCode } from "@opencode/client"
+import { Service } from "@opencode/client/service"
 import { randomUUID } from "node:crypto"
 import { readFile, unlink, writeFile } from "node:fs/promises"
 import { basename } from "node:path"
@@ -49,18 +50,11 @@ function isUnauthorized(userId: string | undefined, userTeamId: string | undefin
   return !!workspaceTeamId && !!userTeamId && userTeamId !== workspaceTeamId
 }
 
-console.log("Starting opencode host...")
-// Embed OpenCode V2 in-process via `@opencode/sdk`. The host loads the on-disk
-// configuration (config/opencode.jsonc) and merges this inline config layer on
-// top of it.
-const opencode = await OpenCode.create({
-  config: {
-    content: JSON.stringify({
-      agents: {
-        // Replace OpenCode's built-in system prompt with our own instructions so that this and
-        // AGENTS.md is the sole source of system-level instructions.
-        build: {
-          system: `
+// The bot talks to the shared OpenCode service over HTTP. `Service.ensure()`
+// discovers the background service or starts one (`opencode serve --service`)
+// as a separate process, so the TUI (`opencode`) and `opencode api` can attach
+// to the same server for debugging.
+const systemPrompt = `
 You are a chatbot running on slack that answers questions for the user. Your chain-of-thought and tool cools are passed
 ephemerally to slack, and the final answer you give is what the user sees.
 
@@ -103,13 +97,18 @@ Example:
 </vega-lite>
 
 Do NOT generate charts when the data is a single number or a very simple answer that doesn't benefit from visualization.
-          `,
-        },
-      },
-    }),
-  },
+`
+
+console.log("Starting opencode service...")
+const endpoint = await Service.ensure({
+  // Highest-priority inline config layer: replace OpenCode's built-in system
+  // prompt with our own so this and AGENTS.md are the only system instructions.
+  env: { OPENCODE_CONFIG_CONTENT: JSON.stringify({ agents: { build: { system: systemPrompt } } }) },
+  onStart: (reason, previousVersion) =>
+    console.log(`- starting OpenCode service (${reason}${previousVersion ? `, replacing ${previousVersion}` : ""})`),
 })
-console.log("Opencode host ready")
+const opencode = OpenCode.make({ baseUrl: endpoint.url, headers: Service.headers(endpoint) })
+console.log(`Opencode service ready at ${endpoint.url}`)
 
 const store = new SessionStore()
 const restored = store.restore()
@@ -283,7 +282,12 @@ async function runPrompt(input: PromptInput): Promise<void> {
   if (!existingSession) {
     console.log("Creating new opencode session...")
     try {
-      const created = await opencode.session.create({ title: `Slack thread ${threadTs}` })
+      const created = await opencode.session.create({
+        title: `Slack thread ${threadTs}`,
+        // Pin every bot session to the data workspace so it does not depend on
+        // the service's own cwd (and so the TUI shows it when opened in data/).
+        location: { directory: DATA_DIR },
+      })
       console.log("Created opencode session:", created.id)
       existingSession = store.createSessionState(created.id, channel, threadTs, isChannel)
       store.set(sessionKey, existingSession)
