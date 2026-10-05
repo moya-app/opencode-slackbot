@@ -212,3 +212,85 @@ export async function publishPendingFinalMessages(client: SlackClient, session: 
 
   return false
 }
+
+// ─── Live stream resilience ──────────────────────────────────────────────────
+//
+// Slack streams are not durable: the server finalises a streamed message after
+// an undocumented lifetime (reports cluster around ~5 minutes, with a shorter
+// idle window in some cases). Once that happens `chat.appendStream` and
+// `chat.stopStream` fail with `message_not_in_streaming_state`, and the message
+// is frozen in Slack's UI as a permanent "Something went wrong" pill.
+//
+// The Slack SDK's own guidance is to detect that error and fall back to
+// `chat.update` using the streamer's `ts` (see the `ChatStreamer.ts` getter:
+// "Can be used with chat.update as a fallback if the stream expires
+// server-side"). The helpers below do exactly that, so a long answer degrades
+// to "no live task updates" instead of an error box.
+
+function slackErrorCode(error: unknown): string | undefined {
+  const e = error as { data?: { error?: string }; error?: string } | undefined
+  return e?.data?.error ?? e?.error
+}
+
+/** True when the stream has been finalised/stopped and can no longer be used. */
+export function isStreamExpiredError(error: unknown): boolean {
+  const code = slackErrorCode(error)
+  return code === "message_not_in_streaming_state" ||
+    code === "stopped_by_user" ||
+    code === "message_not_found" ||
+    code === "message_not_owned_by_app"
+}
+
+function isRateLimitError(error: unknown): boolean {
+  const code = slackErrorCode(error)
+  return code === "ratelimited" || code === "rate_limited"
+}
+
+/** Replace a streamed message that Slack has already finalised with a plain
+ *  message, clearing the "Something went wrong" state (best effort). */
+async function finalizeExpiredStream(client: SlackClient, channel: string, ts: string | undefined): Promise<void> {
+  if (!ts) return
+  try {
+    await client.chat.update({
+      channel,
+      ts,
+      text: "The live progress view timed out, but I'm still working on your answer.",
+    })
+  } catch (e) {
+    console.error("Failed to update expired stream message:", e)
+  }
+}
+
+/**
+ * Run an append/stop against the session stream and never throw into the event
+ * loop. If Slack has already finalised the stream, disable further live updates
+ * and clean up the message instead.
+ *
+ * Returns true if the action succeeded.
+ */
+export async function safeStreamAction(
+  client: SlackClient,
+  session: SessionState,
+  action: () => Promise<unknown>,
+): Promise<boolean> {
+  if (!session.streamer) return false
+  try {
+    await action()
+    return true
+  } catch (error) {
+    if (isStreamExpiredError(error)) {
+      console.error("Slack stream is no longer in a streaming state; disabling live updates:", error)
+      const ts = session.streamer?.ts
+      session.streamer = null
+      await finalizeExpiredStream(client, session.channel, ts)
+      return false
+    }
+    if (isRateLimitError(error)) {
+      // Avoid hammering: this update is dropped and the next flush will retry.
+      console.error("Slack rate limit hit while updating the stream; dropping this update:", error)
+      return false
+    }
+    console.error("Failed to update the Slack stream:", error)
+    return false
+  }
+}

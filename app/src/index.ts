@@ -11,6 +11,7 @@ import type { PromptInput, SlackClient } from "./types"
 import type { IncomingAttachment } from "./types"
 import { SessionStore } from "./session"
 import { startEventLoop } from "./events"
+import { safeStreamAction } from "./slack"
 import { settings, blockedUsers, isBlockedUser } from "./settings"
 
 chdir(DATA_DIR)
@@ -304,13 +305,6 @@ async function runPrompt(input: PromptInput): Promise<void> {
     task_display_mode: "plan",
   })
 
-  const workingTaskId = `working-${Date.now()}`
-  await streamer.append({
-    chunks: [{ type: "task_update", id: workingTaskId, title: "Working on your request", status: "in_progress" }],
-  }).catch((e) => {
-    console.error("Failed to append initial working task update:", e)
-  })
-
   session.streamer = streamer
   session.toolNames = new Map()
   session.textByMessage = new Map()
@@ -318,6 +312,11 @@ async function runPrompt(input: PromptInput): Promise<void> {
   session.publishedMessageIDs = new Set()
   session.thinkingMessageIDs = new Set()
   session.assistantMessageIDs = new Set()
+
+  const workingTaskId = `working-${Date.now()}`
+  await safeStreamAction(client, session, () => session.streamer!.append({
+    chunks: [{ type: "task_update", id: workingTaskId, title: "Working on your request", status: "in_progress" }],
+  }))
 
   store.activeRuns.set(sessionKey, { workingTaskId, textStreamed: false })
 
@@ -373,14 +372,12 @@ async function runPrompt(input: PromptInput): Promise<void> {
   if (promptError) {
     console.error("Prompt failed:", promptError)
     store.activeRuns.delete(sessionKey)
-    await streamer.append({
+    await safeStreamAction(client, session, () => session.streamer!.append({
       chunks: [{ type: "task_update", id: workingTaskId, title: "Working on your request", status: "error" }],
-    }).catch((e) => {
-      console.error("Failed to append error working task update:", e)
-    })
-    await streamer.stop({
+    }))
+    await safeStreamAction(client, session, () => session.streamer!.stop({
       chunks: [{ type: "markdown_text", text: "Sorry, something went wrong. Please try again." } as AnyChunk],
-    })
+    }))
     session.streamer = null
     return
   }

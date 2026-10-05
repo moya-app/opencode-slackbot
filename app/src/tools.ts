@@ -1,6 +1,24 @@
 import type { TaskUpdateChunk } from "@slack/types"
 import { DATA_DIR } from "./types"
 
+/**
+ * Slack limit: "The character limit for chunk sizes for `task_update` and
+ * `plan_update` is 256 characters." Keep every text field well under it.
+ */
+export const TASK_TEXT_LIMIT = 256
+
+/** Trim text to the chunk limit, keeping the start (e.g. a SQL query). */
+export function clampTaskText(value: string, limit = TASK_TEXT_LIMIT): string {
+  if (value.length <= limit) return value
+  return value.slice(0, limit - 1) + "…"
+}
+
+/** Trim text to the chunk limit, keeping the tail (e.g. streaming output). */
+export function clampTaskTextTail(value: string, limit = TASK_TEXT_LIMIT): string {
+  if (value.length <= limit) return value
+  return "…" + value.slice(value.length - (limit - 1))
+}
+
 export type ToolStatus = "in_progress" | "complete" | "error"
 
 export type ToolEvent = {
@@ -36,14 +54,14 @@ export function toolTitle(name: string, input: Record<string, unknown> | undefin
 /** Build a TaskUpdateChunk from a tool event — returns null if no chunk is needed. */
 export function buildToolChunk(tool: ToolEvent): TaskUpdateChunk | null {
   const taskId = tool.id
-  const title = toolTitle(tool.name, tool.input)
+  const title = clampTaskText(toolTitle(tool.name, tool.input))
 
   if (tool.status === "in_progress") {
     let output = tool.output
     if (tool.name.endsWith("run_select_query") && typeof tool.input?.query === "string") {
       output = `\`\`\`sql\n${tool.input.query}\n\`\`\``
     }
-    return { type: "task_update", id: taskId, title, status: "in_progress", output }
+    return { type: "task_update", id: taskId, title, status: "in_progress", output: output === undefined ? undefined : clampTaskText(output) }
   }
   if (tool.status === "complete") {
     return { type: "task_update", id: taskId, title, status: "complete" }
