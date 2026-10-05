@@ -4,12 +4,6 @@ export const DATA_DIR = "/app/data"
 
 export type SlackClient = InstanceType<typeof App>["client"]
 
-export type TodoItem = {
-  content: string
-  status: "pending" | "in_progress" | "completed" | "cancelled"
-  priority: "high" | "medium" | "low"
-}
-
 export type SessionUsage = {
   cost: number
   tokens: {
@@ -23,32 +17,29 @@ export type SessionUsage = {
   }
 }
 
-export type MessageUsage = {
-  cost: number
-  tokens: SessionUsage["tokens"]
-}
-
 export type SessionState = {
   sessionId: string
   channel: string
   thread: string
   isChannel: boolean
-  /** Single stream: tool activity, thinking, working task, todos, and final response. */
+  /** Single stream: tool activity, thinking, working task, and final response. */
   streamer: ReturnType<SlackClient["chatStream"]> | null
-  seenTaskIds: Set<string>
-  todos: TodoItem[]
-  textPartStates: Map<string, string>
-  textPartToMessageID: Map<string, string>
-  messagePartOrder: Map<string, string[]>
-  /** Part IDs belonging to reasoning parts — excluded from the final posted message. */
-  reasoningPartIDs: Set<string>
+  /** Tool call ID → tool name, so later tool events can be titled. */
+  toolNames: Map<string, string>
+  /**
+   * Final assistant text, keyed by assistant message ID and then by the
+   * text-part ordinal the V2 API assigns within that message.
+   */
+  textByMessage: Map<string, Map<number, string>>
+  /** Finish reason per assistant message ID (from `session.step.ended`/`failed`). */
   messageFinishByID: Map<string, string>
   publishedMessageIDs: Set<string>
+  /** Assistant messages with an active in-progress "Thinking" task. */
   thinkingMessageIDs: Set<string>
+  /** Assistant message IDs seen in this run — used to filter fallback publishing. */
   assistantMessageIDs: Set<string>
   lastModelID: string
   usage: SessionUsage
-  messageUsageById: Map<string, MessageUsage>
 }
 
 export type ActiveRunState = {

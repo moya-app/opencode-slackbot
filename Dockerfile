@@ -10,7 +10,7 @@ WORKDIR /app
 # Install uv for most mcps, and fonts for chart rendering
 RUN apt update && apt install -y curl procps fonts-noto-core && \
     curl -LsSf https://astral.sh/uv/install.sh | sh && \
-    bun install -g opencode-ai && \
+    bun install -g @opencode/cli && \
     rm -rf /var/lib/apt/lists/*
 
 # Pre-cache mcp-clickhouse (TODO: Find a better way of doing this pre-caching in a generic fashion

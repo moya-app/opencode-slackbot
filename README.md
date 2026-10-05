@@ -13,8 +13,9 @@ Some examples of what it can be used for:
 
 As it's run in a container it should be fully isolated from the rest of your system.
 
-The default opencode configuration file also restricts permissions so that bash cannot be used (which could exfiltrate
-your secure container environment variables).
+The default opencode configuration file also restricts permissions so that shell, edit, subagent and question tools cannot
+be used (which could exfiltrate your secure container environment variables or block waiting for input that the bot
+cannot provide).
 
 # Setup
 
@@ -157,9 +158,15 @@ The default `docker-compose.yml` mounts three directories:
 
 # Debug Opencode
 
-To debug/see what's happening on the opencode instance connected to slack:
+The bot embeds the OpenCode V2 server in-process via `@opencode/sdk`, so there is no HTTP port to attach to. OpenCode
+logs are written to the container's stdout/stderr alongside the bot's own logs:
 
-    docker compose exec opencode opencode attach http://localhost:4096
+    docker compose logs -f opencode
+
+To inspect or debug the configuration interactively, run the OpenCode CLI in the data directory (this starts a separate
+standalone server for the terminal session):
+
+    docker compose exec opencode bash -c 'cd data; opencode'
 
 # Local Development
 

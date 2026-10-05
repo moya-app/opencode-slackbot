@@ -41,19 +41,14 @@ export class SessionStore {
       thread,
       isChannel,
       streamer: null,
-      seenTaskIds: new Set(),
-      todos: [],
-      textPartStates: new Map(),
-      textPartToMessageID: new Map(),
-      messagePartOrder: new Map(),
-      reasoningPartIDs: new Set(),
+      toolNames: new Map(),
+      textByMessage: new Map(),
       messageFinishByID: new Map(),
       publishedMessageIDs: new Set(),
       thinkingMessageIDs: new Set(),
       assistantMessageIDs: new Set(),
       lastModelID: "",
       usage: emptyUsage(),
-      messageUsageById: new Map(),
     }
   }
 
@@ -105,19 +100,14 @@ export class SessionStore {
   }
 
   resetRunState(session: SessionState): void {
-    session.seenTaskIds = new Set()
-    session.todos = []
-    session.textPartStates = new Map()
-    session.textPartToMessageID = new Map()
-    session.messagePartOrder = new Map()
-    session.reasoningPartIDs = new Set()
+    session.toolNames = new Map()
+    session.textByMessage = new Map()
     session.messageFinishByID = new Map()
     session.publishedMessageIDs = new Set()
     session.thinkingMessageIDs = new Set()
     session.assistantMessageIDs = new Set()
-    session.lastModelID = ""
-    session.usage = emptyUsage()
-    session.messageUsageById = new Map()
+    // `lastModelID` and `usage` are session-level (not per-run) and are kept so
+    // the cost/model summary persists across turns of the same thread.
     // streamer is nulled by the event loop after stopping; reset here defensively
     session.streamer = null
   }
