@@ -2,8 +2,15 @@ import type { AnyChunk } from "@slack/types"
 import type { OpenCodeEvent } from "@opencode/sdk"
 import type { SlackClient, SessionState } from "./types"
 import type { SessionStore } from "./session"
-import { buildToolChunk } from "./tools"
-import { appendTextPart, setTextPart, tryPublishFinalMessage, publishPendingFinalMessages, postAssistantResponse } from "./slack"
+import { buildToolChunk, clampTaskTextTail } from "./tools"
+import { appendTextPart, setTextPart, tryPublishFinalMessage, publishPendingFinalMessages, postAssistantResponse, safeStreamAction } from "./slack"
+
+/**
+ * Slack's `chat.appendStream` is rate limited (Tier 4, ~100 calls/minute), and
+ * streams are expensive, so batch updates into ~1s windows rather than the old
+ * 350 ms (which could issue ~170 calls/minute).
+ */
+const FLUSH_INTERVAL_MS = 1000
 
 /** Minimal structural type for the embedded OpenCode host — avoids a hard import. */
 type EventSource = {
@@ -32,19 +39,18 @@ export async function startEventLoop(
       if (thinkingUpdates.size > 0) {
         for (const [messageID, delta] of thinkingUpdates.entries()) {
           if (!session.thinkingMessageIDs.has(messageID)) continue
-          const safe = delta.length > 600 ? delta.slice(-600) : delta
           chunks.push({
             type: "task_update",
             id: `thinking-${messageID}`,
             title: "Thinking",
             status: "in_progress",
-            output: safe,
+            output: clampTaskTextTail(delta),
           })
         }
       }
 
       if (chunks.length > 0) {
-        await session.streamer.append({ chunks })
+        await safeStreamAction(client, session, () => session.streamer!.append({ chunks }))
       }
     } catch (e) {
       console.error("Failed to flush stream event updates:", e)
@@ -74,7 +80,7 @@ export async function startEventLoop(
 
   function scheduleFlush() {
     if (!flushTimer) {
-      flushTimer = setTimeout(flushStreamEvents, 350)
+      flushTimer = setTimeout(flushStreamEvents, FLUSH_INTERVAL_MS)
     }
   }
 
@@ -103,11 +109,9 @@ export async function startEventLoop(
     }
     session.thinkingMessageIDs.delete(messageID)
     if (session.streamer) {
-      await session.streamer.append({
+      await safeStreamAction(client, session, () => session.streamer!.append({
         chunks: [{ type: "task_update", id: `thinking-${messageID}`, title: "Thinking", status: "complete" }],
-      }).catch((e) => {
-        console.error("Failed to complete thinking task:", e)
-      })
+      }))
     }
   }
 
@@ -129,6 +133,18 @@ export async function startEventLoop(
     const published = await publishPendingFinalMessages(client, session)
     const run = store.activeRuns.get(key)
     if (run && published) run.textStreamed = true
+
+    const fallback = failed
+      ? `Sorry, something went wrong${reason ? `: ${reason}` : ""}. Please try again.`
+      : "I completed the request but did not receive a text response from model output."
+
+    // Always make sure the user gets *something*, even if the live stream
+    // expired before any final text could be published.
+    if (run && !published) {
+      await postAssistantResponse(client, session, fallback).catch((e) => {
+        console.error("Failed to post fallback response:", e)
+      })
+    }
 
     if (run && session.streamer) {
       const stopChunks: AnyChunk[] = []
@@ -152,21 +168,14 @@ export async function startEventLoop(
         }
       }
 
-      // If no text was streamed, include a fallback so the plan pane is never empty.
-      if (!run.textStreamed) {
-        const fallback = failed
-          ? `Sorry, something went wrong${reason ? `: ${reason}` : ""}. Please try again.`
-          : "I completed the request but did not receive a text response from model output."
+      // If no final message was published, include a fallback so the plan pane
+      // is never left empty.
+      if (!published) {
         stopChunks.push({ type: "markdown_text", text: fallback } as AnyChunk)
-        await postAssistantResponse(client, session, fallback).catch((e) => {
-          console.error("Failed to post fallback response:", e)
-        })
       }
 
       console.log(`[session] finalize: stopping streamer with ${stopChunks.length} stop chunk(s)`)
-      await session.streamer.stop({ chunks: stopChunks }).catch((e) => {
-        console.error("Failed to stop stream on finalize:", e)
-      })
+      await safeStreamAction(client, session, () => session.streamer!.stop({ chunks: stopChunks }))
 
       session.streamer = null
     }
