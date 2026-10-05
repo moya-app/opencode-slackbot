@@ -3,16 +3,18 @@
 ## Overview
 
 This directory contains the Slack bot runtime that bridges Slack Assistant events and `@mentions` to an OpenCode V2
-session. The app runs in Bun, receives user messages, forwards prompts to an embedded OpenCode host, and streams
-tool/task updates and final responses back into Slack threads.
+session. The app runs in Bun, receives user messages, forwards prompts to the shared OpenCode service over HTTP, and
+streams tool/task updates and final responses back into Slack threads.
 
 ## Project Layout
 
 - `src/index.ts`
-  - Entry point. Initializes Slack Bolt (`App`, `Assistant`) and the embedded OpenCode V2 host
-    (`OpenCode.create(...)` from `@opencode/sdk`).
-  - The host runs in-process (no HTTP listener). The system prompt and any inline overrides are passed through the
-    host's `config.content` layer, which merges on top of the on-disk `config/opencode.jsonc`.
+  - Entry point. Initializes Slack Bolt (`App`, `Assistant`) and an `@opencode/client` connection to the shared
+    OpenCode service.
+  - `Service.ensure()` (from `@opencode/client/service`) discovers the background service or starts one
+    (`opencode serve --service`) as a separate process, so the TUI and `opencode api` can attach to the same server for
+    debugging. The system prompt is injected through the highest-priority `OPENCODE_CONFIG_CONTENT` env var, which
+    merges on top of the on-disk `config/opencode.jsonc`.
   - Creates the `SessionStore` and starts the global event loop.
   - Implements `runPrompt` (shared logic for all surfaces) and registers Slack event handlers: Assistant `userMessage`,
     `app_mention`, `message` (DMs), and the `feedback` button action.
@@ -70,7 +72,7 @@ tool/task updates and final responses back into Slack threads.
     - `typecheck`: runs TypeScript checks via `tsgo --noEmit`.
   - Core dependencies:
     - `@slack/bolt`
-    - `@opencode/sdk`
+    - `@opencode/client`
 
 - `tsconfig.json`
   - TypeScript compiler settings for this app.
@@ -80,7 +82,7 @@ tool/task updates and final responses back into Slack threads.
 
 ## Runtime Flow
 
-1. Start Bolt app and the embedded OpenCode V2 host.
+1. Start Bolt app and connect to the shared OpenCode service (starting it if needed).
 2. `startEventLoop` subscribes to OpenCode events in the background.
 3. Receive message from Assistant pane, channel mention, or DM.
 4. `runPrompt` resolves or creates a thread session via `SessionStore`.
