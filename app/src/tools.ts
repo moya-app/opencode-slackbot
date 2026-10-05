@@ -19,7 +19,13 @@ export function clampTaskTextTail(value: string, limit = TASK_TEXT_LIMIT): strin
   return "…" + value.slice(value.length - (limit - 1))
 }
 
-export type ToolStatus = "in_progress" | "complete" | "error"
+/**
+ * Slack's plan pane is the user-facing chain of thought, so tool tasks are
+ * never shown in an error state: a failed or denied tool call (e.g. a shell
+ * command refused by permissions) is just another completed step. Any error
+ * worth surfacing is explained in the final response instead.
+ */
+export type ToolStatus = "in_progress" | "complete"
 
 export type ToolEvent = {
   /** Tool call ID (stable across started/called/success/failed events). */
@@ -63,8 +69,5 @@ export function buildToolChunk(tool: ToolEvent): TaskUpdateChunk | null {
     }
     return { type: "task_update", id: taskId, title, status: "in_progress", output: output === undefined ? undefined : clampTaskText(output) }
   }
-  if (tool.status === "complete") {
-    return { type: "task_update", id: taskId, title, status: "complete" }
-  }
-  return { type: "task_update", id: taskId, title, status: "error" }
+  return { type: "task_update", id: taskId, title, status: "complete" }
 }

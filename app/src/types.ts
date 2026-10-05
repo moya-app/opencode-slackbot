@@ -46,7 +46,9 @@ export type SessionState = {
 
 export type ActiveRunState = {
   workingTaskId: string
-  textStreamed: boolean
+  /** Resolves when the run has finalized — used to serialize runs per thread. */
+  done: Promise<void>
+  resolveDone: () => void
 }
 
 export type IncomingAttachment = {

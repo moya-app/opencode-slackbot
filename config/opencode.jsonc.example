@@ -54,8 +54,8 @@
     { "action": "mcp-clickhouse_run_select_query", "resource": "*", "effect": "allow" },
     */
 
-    // Allow access to uploads
-    { "action": "external_directory", "resource": "/tmp/*", "effect": "allow" }
+    // No access to external directories
+    { "action": "external_directory", "resource": "*", "effect": "deny" },
   ],
   "agents": {
     "build": {

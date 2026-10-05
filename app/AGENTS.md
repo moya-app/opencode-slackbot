@@ -13,8 +13,12 @@ streams tool/task updates and final responses back into Slack threads.
     OpenCode service.
   - `Service.ensure()` (from `@opencode/client/service`) discovers the background service or starts one
     (`opencode serve --service`) as a separate process, so the TUI and `opencode api` can attach to the same server for
-    debugging. The system prompt is injected through the highest-priority `OPENCODE_CONFIG_CONTENT` env var, which
-    merges on top of the on-disk `config/opencode.jsonc`.
+    debugging. The static system prompt is injected through the highest-priority `OPENCODE_CONFIG_CONTENT` env var,
+    which merges on top of the on-disk `config/opencode.jsonc`.
+  - The session-specific part of the system prompt (the scratch-directory and file-sending guidance) is attached once
+    per session at session begin via `opencode.session.instructions.entry.put` — V2's session-scoped instruction
+    entries, the replacement for the v1 per-prompt `system` field. `ensureSessionInstructions` does this and
+    `buildSessionInstructions` builds the text.
   - Creates the `SessionStore` and starts the global event loop.
   - Implements `runPrompt` (shared logic for all surfaces) and registers Slack event handlers: Assistant `userMessage`,
     `app_mention`, `message` (DMs), and the `feedback` button action.
@@ -57,14 +61,32 @@ streams tool/task updates and final responses back into Slack threads.
     `renderAndUploadCharts` compiles specs to PNG (via `vega` + `vega-lite` + `@resvg/resvg-js`) and uploads them to
     the Slack thread.
 
+- `src/paths.ts`
+  - Shared staging path helpers: `STAGING_ROOT` (`$TMPDIR/opencode-slack`) and `stagingDirFor(sessionId)` — the
+    per-session upload/scratch directory. Used by `index.ts` (staging, sweep, permissions) and `files.ts`
+    (send-time validation).
+
+- `src/files.ts`
+  - Outbound files. `extractSlackFiles` parses `<slack-file>{...}</slack-file>` directives out of the final answer
+    (mirroring `<vega-lite>`); `uploadSlackFiles` resolves each path, rejects anything outside the session's own
+    scratch directory (or over the size cap), and uploads it to the Slack thread via `files.uploadV2`. Gated by the
+    `SEND_FILE_MAX_SIZE` env var: `0` disables sending (directives are still stripped from the text but nothing is
+    uploaded and the per-session instructions omit the "Sending files to the user" guidance); otherwise it is the max
+    file size in bytes (default 50 MiB).
+
 - `src/events.ts`
   - `startEventLoop`: subscribes to the OpenCode V2 event stream and processes events in batched 1 s flush windows
     (chosen to stay under Slack's `chat.appendStream` Tier 4 rate limit).
   - Handles the V2 events: `session.text.started/delta/ended`, `session.reasoning.started/delta`,
     `session.step.started/ended/failed`, `session.tool.input.started`, `session.tool.called/success/failed`,
     `session.usage.updated`, `session.execution.succeeded/failed/interrupted`, and `session.idle`.
-  - Structured errors (`session.step.failed` / `session.execution.failed`) are captured on the session and always
-    posted back to the Slack thread via `postAssistantResponse`, so failures are never silent.
+  - Individual `session.step.failed` / `session.tool.failed` events (denied tool calls, provider hiccups) are **not**
+    run failures: they are logged, the task is marked complete, and the agent is left to recover. Only
+    `session.execution.failed` (and `session.execution.interrupted`) ends the run as failed, and its structured error
+    is posted to the thread via `postAssistantResponse` so genuine failures are never silent.
+  - The Slack plan pane is the user-facing chain of thought and must never render an error state, so all task updates
+    (`Working on your request`, `Thinking`, tool tasks) always use status `complete` on finish. Any error worth
+    reporting goes in the final response text, not the chain of thought.
 
 - `package.json`
   - Runtime scripts:
@@ -85,22 +107,29 @@ streams tool/task updates and final responses back into Slack threads.
 1. Start Bolt app and connect to the shared OpenCode service (starting it if needed).
 2. `startEventLoop` subscribes to OpenCode events in the background.
 3. Receive message from Assistant pane, channel mention, or DM.
-4. `runPrompt` resolves or creates a thread session via `SessionStore`.
+4. `runPrompt` resolves or creates a thread session via `SessionStore`. Runs are serialized per thread: a prompt waits
+   for the previous run on the same thread to finalize before taking over the session state (`runQueue` in
+   `src/index.ts`).
 5. Open a single Slack `chatStream` with `task_display_mode: "plan"` on the thread. This single stream receives all
    chunks — working task, tool activity, thinking, and (via `streamer.stop`) the final answer — which Slack collapses
    into one grouped block.
-6. Send the prompt to OpenCode via `session.prompt({ sessionID, text, files })` (images and pasted tables are sent as
-   data-URI attachments). The call returns as soon as the input is admitted; output arrives asynchronously via events.
+6. Send the prompt to OpenCode via `session.prompt({ sessionID, text, files })`. Uploaded files are downloaded into a
+   per-session directory under `/tmp/opencode-slack/<session>/` and listed by path in the prompt text so the agent
+   reads them itself with the `read` tool. The scratch directory itself is announced once per session as a
+   session-scoped system instruction (see `ensureSessionInstructions`), not repeated on each message. Pasted tables
+   (inline data, not uploads) are sent as data-URI attachments. The call returns as soon as the input is admitted;
+   output arrives asynchronously via events.
 7. The event loop receives `session.text.delta` / `session.reasoning.delta` events, batches thinking/tool chunks, and
    flushes them to `streamer` every 1 s.
 8. `session.tool.*` events create/complete the tool tasks shown in the plan pane; `todowrite` no longer exists in V2.
 9. `session.step.ended` records the finish reason and completes the message's thinking task. A `stop` step publishes the
    final response via `postAssistantResponse` (a proper `chat.postMessage` with cost info and feedback buttons).
 10. On `session.idle` (or `session.execution.succeeded/failed/interrupted`, whichever arrives first), remaining pending
-    chunks are flushed, any un-published final message is posted, the working task is completed, and the stream is
-    stopped.
-11. If the run failed, the structured error is posted to the thread (and shown in the plan pane) so the user sees what
-    went wrong instead of a silent stop.
+    chunks are flushed, any un-published final message is posted, the working task is completed, the stream is stopped,
+    and the run slot is released for the next prompt on the thread.
+11. Only a genuine run failure (`session.execution.failed` / `session.execution.interrupted`) posts an error
+    explanation; individual tool/step failures (including denied shell commands) are ignored as run failures and never
+    put the plan pane into an error state. `session.idle` always finalises as success.
 
 ## Session State
 
@@ -121,7 +150,23 @@ Each thread session (`SessionState`) tracks:
 
 - Keep assistant, mention, and DM handlers aligned by extending `runPrompt` rather than duplicating logic.
 - Add new tool-specific rendering inside `buildToolChunk` in `src/tools.ts`.
-- The event loop batches chunks over 1 s windows — keep flush logic inside `flushEntry` in `src/events.ts`.
+- The event loop batches chunks over 1 s windows — keep flush logic inside `flushEntry` in `src/events.ts`. A
+  `rate_limited` result re-queues the chunks for the next flush; any other failure drops them.
+- Runs are serialized per thread with `runQueue` in `src/index.ts`. `finalizeSession` resolves the run's `done` promise
+  (which releases the next queued prompt); keep that in sync when changing the run lifecycle.
+- Uploaded files live in a per-session directory under `/tmp/opencode-slack/<session>/` and are read by the agent by
+  path. That same directory is the agent's only writable scratch space: `runPrompt` creates it and announces its path
+  once per session through a session-scoped instruction entry (`ensureSessionInstructions`, key `slack.session`), so
+  it can redirect command output (e.g. `clickhouse-client` query results) to a file and read it back without the path
+  being repeated before every message. Files are **not** deleted at run end (the agent may read them partially or
+  re-read them in a later turn), so `sweepStaleStaging` removes files older than 24 h hourly and at startup.
+- `runPrompt` calls `session.update` to set per-session permissions that allow `external_directory` only for that
+  session's own directory, so a session cannot read another session's uploads. Note the global config (and the
+  example) deny `external_directory` for `*`, so that per-session allow is what grants access — if the `session.update`
+  call fails, the agent cannot reach its scratch directory at all.
+- To send a file to the user, the agent writes it into its session scratch directory and emits a `<slack-file>` JSON
+  directive in its final answer; `postAssistantResponse` strips the directive and `uploadSlackFiles` uploads it. The
+  path is confined to `stagingDirFor(session.sessionId)`, so keep that validation when changing this flow.
 - `isChannel: true` is set for `app_mention` events; `postAssistantResponse` uses `reply_broadcast: true` in that case
   so the final reply surfaces in the channel.
 - Feedback deduplication is handled by `SessionStore.feedbackGiven` — the first click updates the original message in

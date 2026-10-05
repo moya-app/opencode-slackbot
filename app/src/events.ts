@@ -44,7 +44,7 @@ export async function startEventLoop(
   const pending = new Map<string, PendingEntry>()
   let flushTimer: ReturnType<typeof setTimeout> | null = null
 
-  async function flushEntry(entry: PendingEntry) {
+  async function flushEntry(key: string, entry: PendingEntry) {
     const { session, chunks, thinkingUpdates } = entry
 
     if (!session.streamer) return
@@ -63,7 +63,15 @@ export async function startEventLoop(
       }
 
       if (chunks.length > 0) {
-        await safeStreamAction(client, session, () => session.streamer!.append({ chunks }))
+        const result = await safeStreamAction(client, session, () => session.streamer!.append({ chunks }))
+        if (result === "rate_limited") {
+          // Transient failure: keep these chunks queued so the next flush retries
+          // them rather than losing the update (a final tool task could otherwise
+          // stay stuck on "in_progress").
+          const retry = getOrCreatePending(key, session)
+          retry.chunks.push(...chunks)
+          scheduleFlush()
+        }
       }
     } catch (e) {
       console.error("Failed to flush stream event updates:", e)
@@ -77,8 +85,8 @@ export async function startEventLoop(
     const snapshot = new Map(pending)
     pending.clear()
 
-    for (const entry of snapshot.values()) {
-      await flushEntry(entry)
+    for (const [key, entry] of snapshot) {
+      await flushEntry(key, entry)
     }
   }
 
@@ -112,13 +120,17 @@ export async function startEventLoop(
     entry.thinkingUpdates.set(messageID, previous + delta)
   }
 
-  /** Flush any pending thinking output, then mark the thinking task complete. */
-  async function completeThinking(key: string, session: SessionState, messageID: string) {
+  /** Flush any pending thinking output, then mark the thinking task finished. */
+  async function completeThinking(
+    key: string,
+    session: SessionState,
+    messageID: string,
+  ) {
     if (!session.thinkingMessageIDs.has(messageID)) return
     const pendingEntry = pending.get(key)
     if (pendingEntry) {
       pending.delete(key) // remove first so the flush timer can't double-process
-      await flushEntry(pendingEntry).catch(() => {})
+      await flushEntry(key, pendingEntry).catch(() => {})
     }
     session.thinkingMessageIDs.delete(messageID)
     if (session.streamer) {
@@ -135,72 +147,84 @@ export async function startEventLoop(
    * `session.idle` to arrive wins; later ones are no-ops.
    */
   async function finalizeSession(key: string, session: SessionState, failed: boolean) {
-    if (!store.activeRuns.has(key)) return
-
-    const pendingEntry = pending.get(key)
-    if (pendingEntry) {
-      pending.delete(key)
-      await flushEntry(pendingEntry)
-    }
-
-    const published = await publishPendingFinalMessages(client, session)
     const run = store.activeRuns.get(key)
-    if (run && published) run.textStreamed = true
+    if (!run) return
 
-    // Decide what (if anything) the user still needs to see for this run. On
-    // failure we always post an explanation, even if partial text was already
-    // published, so errors are never silent.
-    let outcomeText: string | null = null
-    if (failed) {
-      const detail = session.lastError.trim()
-      outcomeText = detail
-        ? `:warning: Sorry, I couldn't complete that request: ${detail}`
-        : ":warning: Sorry, something went wrong while working on that request. Please try again."
-    } else if (!published) {
-      outcomeText = "I completed the request but did not receive a text response from model output."
-    }
-
-    if (outcomeText) {
-      await postAssistantResponse(client, session, outcomeText).catch((e) => {
-        console.error("Failed to post run outcome to Slack:", e)
-      })
-    }
-
-    if (run && session.streamer) {
-      const stopChunks: AnyChunk[] = []
-
-      stopChunks.push({
-        type: "task_update",
-        id: run.workingTaskId,
-        title: "Working on your request",
-        status: failed ? "error" : "complete",
-      })
-
-      if (session.thinkingMessageIDs.size > 0) {
-        console.log(`[session] finalize: completing ${session.thinkingMessageIDs.size} thinking task(s)`)
-        for (const messageID of session.thinkingMessageIDs) {
-          stopChunks.push({
-            type: "task_update",
-            id: `thinking-${messageID}`,
-            title: "Thinking",
-            status: failed ? "error" : "complete",
-          })
-        }
+    try {
+      const pendingEntry = pending.get(key)
+      if (pendingEntry) {
+        pending.delete(key)
+        await flushEntry(key, pendingEntry)
       }
 
-      // Surface the outcome (error or no-text fallback) in the plan pane too.
+      const published = await publishPendingFinalMessages(client, session)
+
+      // Decide what (if anything) the user still needs to see for this run. On
+      // failure we always post an explanation, even if partial text was already
+      // published, so errors are never silent.
+      let outcomeText: string | null = null
+      if (failed) {
+        const detail = session.lastError.trim()
+        outcomeText = detail
+          ? `:warning: Sorry, I couldn't complete that request: ${detail}`
+          : ":warning: Sorry, something went wrong while working on that request. Please try again."
+      } else if (!published) {
+        outcomeText = "I completed the request but did not receive a text response from model output."
+      }
+
       if (outcomeText) {
-        stopChunks.push({ type: "markdown_text", text: outcomeText } as AnyChunk)
+        await postAssistantResponse(client, session, outcomeText).catch((e) => {
+          console.error("Failed to post run outcome to Slack:", e)
+        })
       }
 
-      console.log(`[session] finalize: stopping streamer with ${stopChunks.length} stop chunk(s)`)
-      await safeStreamAction(client, session, () => session.streamer!.stop({ chunks: stopChunks }))
+      if (session.streamer) {
+        const stopChunks: AnyChunk[] = []
 
-      session.streamer = null
+        // Task statuses are always "complete": the plan pane is the chain of
+        // thought and must never show an error state. Failures are explained in
+        // the final response text (outcomeText) instead.
+        stopChunks.push({
+          type: "task_update",
+          id: run.workingTaskId,
+          title: "Working on your request",
+          status: "complete",
+        })
+
+        if (session.thinkingMessageIDs.size > 0) {
+          console.log(`[session] finalize: completing ${session.thinkingMessageIDs.size} thinking task(s)`)
+          for (const messageID of session.thinkingMessageIDs) {
+            stopChunks.push({
+              type: "task_update",
+              id: `thinking-${messageID}`,
+              title: "Thinking",
+              status: "complete",
+            })
+          }
+        }
+
+        // Surface the outcome (error or no-text fallback) in the plan pane too.
+        if (outcomeText) {
+          stopChunks.push({ type: "markdown_text", text: outcomeText } as AnyChunk)
+        }
+
+        console.log(`[session] finalize: stopping streamer with ${stopChunks.length} stop chunk(s)`)
+        await safeStreamAction(client, session, () => session.streamer!.stop({ chunks: stopChunks }))
+
+        session.streamer = null
+      }
+    } catch (e) {
+      // Never let a publish/stop failure take down the shared event loop.
+      console.error(`[session] finalize failed for ${key}:`, e)
+    } finally {
+      // Always release the run slot and reset per-run state, then let any
+      // prompt waiting for this run proceed. Staged uploads are not deleted
+      // here — the agent may still re-read them in a later turn. They are
+      // swept by TTL instead.
+      store.activeRuns.delete(key)
+      store.resetRunState(session)
+      run.resolveDone()
     }
-
-    store.activeRuns.delete(key)
-    store.resetRunState(session)
   }
 
   for await (const event of opencode.event.subscribe()) {
@@ -230,9 +254,6 @@ export async function startEventLoop(
         startThinking(session, assistantMessageID)
         streamThinking(entry, session, assistantMessageID, delta)
 
-        const run = store.activeRuns.get(key)
-        if (run) run.textStreamed = true
-
         scheduleFlush()
         break
       }
@@ -241,15 +262,11 @@ export async function startEventLoop(
         const { sessionID, assistantMessageID, ordinal, text } = event.data
         const match = store.findBySessionId(sessionID)
         if (!match) break
-        const [key, session] = match
+        const [, session] = match
         session.assistantMessageIDs.add(assistantMessageID)
         setTextPart(session, assistantMessageID, ordinal, text)
 
-        const posted = await tryPublishFinalMessage(client, session, assistantMessageID)
-        if (posted) {
-          const run = store.activeRuns.get(key)
-          if (run) run.textStreamed = true
-        }
+        await tryPublishFinalMessage(client, session, assistantMessageID)
         break
       }
 
@@ -304,11 +321,7 @@ export async function startEventLoop(
         await completeThinking(key, session, assistantMessageID)
 
         if (finish === "stop") {
-          const posted = await tryPublishFinalMessage(client, session, assistantMessageID)
-          if (posted) {
-            const run = store.activeRuns.get(key)
-            if (run) run.textStreamed = true
-          }
+          await tryPublishFinalMessage(client, session, assistantMessageID)
         }
         break
       }
@@ -318,9 +331,12 @@ export async function startEventLoop(
         const match = store.findBySessionId(sessionID)
         if (!match) break
         const [key, session] = match
+        // A failed step (e.g. a denied tool call or a provider hiccup) is not
+        // fatal: the agent usually recovers and finishes the run in a later
+        // step, and a genuine run failure still arrives as
+        // `session.execution.failed`. Log it, but never treat it as the run's
+        // error or surface it in the plan pane.
         console.error(`[session] step failed for ${assistantMessageID}:`, error)
-        const detail = formatSessionError(error)
-        if (detail) session.lastError = detail
         await completeThinking(key, session, assistantMessageID)
         break
       }
@@ -381,7 +397,9 @@ export async function startEventLoop(
         const [key, session] = match
         if (!session.streamer) break
         const name = session.toolNames.get(id) ?? id
-        const chunk = buildToolChunk({ id, name, status: "error" })
+        // Denied/failed tools still complete the task — the plan pane must never
+        // show an error. The agent explains any real problem in its final answer.
+        const chunk = buildToolChunk({ id, name, status: "complete" })
         if (chunk) {
           const entry = getOrCreatePending(key, session)
           entry.chunks.push(chunk)
@@ -440,8 +458,11 @@ export async function startEventLoop(
         if (!match) break
         const [key, session] = match
         console.log(`[session] idle: found session key=${key}, thinkingMessageIDs.size=${session.thinkingMessageIDs.size}`)
-        // If a step failed and no execution event carried the error, surface it.
-        await finalizeSession(key, session, session.lastError.trim().length > 0)
+        // Idle means the agent stopped working, not that the run failed. A
+        // failure is only ever reported by `session.execution.failed`; treating
+        // a lingering step error as fatal made every denied tool call look like
+        // a broken run.
+        await finalizeSession(key, session, false)
         break
       }
 
