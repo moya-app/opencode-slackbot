@@ -160,10 +160,11 @@ Each thread session (`SessionState`) tracks:
   it can redirect command output (e.g. `clickhouse-client` query results) to a file and read it back without the path
   being repeated before every message. Files are **not** deleted at run end (the agent may read them partially or
   re-read them in a later turn), so `sweepStaleStaging` removes files older than 24 h hourly and at startup.
-- `runPrompt` calls `session.update` to set per-session permissions that allow `external_directory` only for that
-  session's own directory, so a session cannot read another session's uploads. Note the global config (and the
-  example) deny `external_directory` for `*`, so that per-session allow is what grants access — if the `session.update`
-  call fails, the agent cannot reach its scratch directory at all.
+- `runPrompt` calls `session.update` to set per-session permissions that allow `external_directory`, `read`, and `edit`
+  only for that session's own directory, so a session cannot read or write another session's uploads but can read and
+  write its own scratch space by default. Note the global config (and the example) deny `external_directory` and `edit`
+  for `*`, so those per-session allows are what grant access — if the `session.update` call fails, the agent cannot
+  reach its scratch directory at all.
 - To send a file to the user, the agent writes it into its session scratch directory and emits a `<slack-file>` JSON
   directive in its final answer; `postAssistantResponse` strips the directive and `uploadSlackFiles` uploads it. The
   path is confined to `stagingDirFor(session.sessionId)`, so keep that validation when changing this flow.

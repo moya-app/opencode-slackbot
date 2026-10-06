@@ -275,13 +275,22 @@ async function sweepStaleStaging(): Promise<void> {
 }
 
 /**
- * No matter what user permissions there were, allow session's external-directory access to its own staging directory.
+ * No matter what user permissions there were, allow the session to read and write
+ * its own staging/scratch directory. The `external_directory` rules grant access
+ * to the directory (which sits outside the workspace), while the `read`/`edit`
+ * rules grant the actions themselves even when the global config denies them for
+ * other paths (`edit` covers `edit`, `write`, and `patch`).
  */
 function sessionPermissions(sessionId: string) {
   const dir = stagingDirFor(sessionId)
+  const allows = (action: string) => [
+    { action, resource: dir, effect: "allow" as const },
+    { action, resource: `${dir}/**`, effect: "allow" as const },
+  ]
   return [
-    { action: "external_directory", resource: dir, effect: "allow" as const },
-    { action: "external_directory", resource: `${dir}/**`, effect: "allow" as const },
+    ...allows("external_directory"),
+    ...allows("read"),
+    ...allows("edit"),
   ]
 }
 
@@ -295,8 +304,8 @@ async function ensureSessionPermissions(sessionId: string): Promise<void> {
     permissionsConfigured.add(sessionId)
   } catch (error) {
     // Non-fatal for the rest of the bot, but note the global config denies
-    // external_directory (*), so without this allow entry the agent cannot
-    // read or write its own scratch directory.
+    // external_directory (*) and edit (*), so without these allow entries the
+    // agent cannot read or write its own scratch directory.
     console.error(`Failed to restrict external access for session ${sessionId}:`, error)
   }
 }
