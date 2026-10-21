@@ -22,7 +22,7 @@ streams tool/task updates and final responses back into Slack threads.
   - Creates the `SessionStore` and starts the global event loop.
   - Implements `runPrompt` (shared logic for all surfaces) and registers Slack event handlers: Assistant `userMessage`,
     `app_mention`, `message` (DMs and channel thread replies, including `thread_broadcast` replies where the user ticked
-    "Also send to channel"), and the `feedback` button action.
+    "Also send to channel"), `agent_session_stopped` (native stop control), and the `feedback` button action.
 
 - `src/types.ts`
   - All shared types: `SessionUsage`, `SessionState`, `ActiveRunState`, `PromptInput`, `SlackClient`.
@@ -148,6 +148,8 @@ Each thread session (`SessionState`) tracks:
 - `thinkingMessageIDs` — messages with an active in-progress thinking task
 - `assistantMessageIDs` — assistant message IDs seen in the run (used to filter fallback publishing)
 - `lastModelID`, `usage` — model and cost/token tracking
+- `interrupt` — calls `opencode.session.interrupt` for this session (wired in `runPrompt`)
+- `userStopped` — set when the user stopped the run, so it is reported as "Stopped at your request." not an error
 
 ## Notes for Future Changes
 
@@ -159,6 +161,11 @@ Each thread session (`SessionState`) tracks:
   (which releases the next queued prompt); keep that in sync when changing the run lifecycle. A run that shows no
   activity for `RUN_STALE_MS` (no OpenCode events, no pre-prompt progress) is released by
   `waitForPreviousRun` so one lost terminal event cannot silence a thread forever.
+- Interrupting: Slack shows a native stop control while an agent session is processing and fires the
+  `agent_session_stopped` event when it is pressed (subscribe to it in the app manifest — `chat:write` scope).
+  The handler calls `interruptSession`, which uses `opencode.session.interrupt` and sets `session.userStopped` so
+  finalisation reports "Stopped at your request." instead of an error. As a fallback (for example if the event
+  subscription is missing), a `stopped_by_user` error on the next stream append/stop is treated the same way.
 - Uploaded files live in a per-session directory under `/tmp/opencode-slack/<session>/` and are read by the agent by
   path. That same directory is the agent's only writable scratch space: `runPrompt` creates it and announces its path
   once per session through a session-scoped instruction entry (`ensureSessionInstructions`, key `slack.session`), so

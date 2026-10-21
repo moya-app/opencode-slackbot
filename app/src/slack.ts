@@ -246,9 +246,13 @@ function slackErrorCode(error: unknown): string | undefined {
 export function isStreamExpiredError(error: unknown): boolean {
   const code = slackErrorCode(error)
   return code === "message_not_in_streaming_state" ||
-    code === "stopped_by_user" ||
     code === "message_not_found" ||
     code === "message_not_owned_by_app"
+}
+
+/** True when the user pressed Slack's Stop control on a streaming message. */
+export function isUserStoppedError(error: unknown): boolean {
+  return slackErrorCode(error) === "stopped_by_user"
 }
 
 function isRateLimitError(error: unknown): boolean {
@@ -272,12 +276,13 @@ async function finalizeExpiredStream(client: SlackClient, channel: string, ts: s
 }
 
 /** Outcome of a stream action, so callers can decide whether a retry is useful. */
-export type StreamActionResult = "ok" | "expired" | "rate_limited" | "failed"
+export type StreamActionResult = "ok" | "expired" | "stopped" | "rate_limited" | "failed"
 
 /**
  * Run an append/stop against the session stream and never throw into the event
  * loop. If Slack has already finalised the stream, disable further live updates
- * and clean up the message instead.
+ * and clean up the message instead. If the user pressed Slack's Stop control on
+ * the stream, interrupt the OpenCode run too.
  */
 export async function safeStreamAction(
   client: SlackClient,
@@ -289,6 +294,17 @@ export async function safeStreamAction(
     await action()
     return "ok"
   } catch (error) {
+    if (isUserStoppedError(error)) {
+      // Slack's stream UI has its own Stop control; treat it as a request to
+      // interrupt the run rather than just giving up on live updates.
+      console.log("Slack stream was stopped by the user; interrupting the OpenCode run")
+      session.streamer = null
+      session.userStopped = true
+      await session.interrupt?.().catch((e) => {
+        console.error("Failed to interrupt the OpenCode run after the user stopped the stream:", e)
+      })
+      return "stopped"
+    }
     if (isStreamExpiredError(error)) {
       console.error("Slack stream is no longer in a streaming state; disabling live updates:", error)
       const ts = session.streamer?.ts

@@ -24,6 +24,10 @@ export type SessionState = {
   isChannel: boolean
   /** Single stream: tool activity, thinking, working task, and final response. */
   streamer: ReturnType<SlackClient["chatStream"]> | null
+  /** Interrupts the OpenCode run for this session (wired up in `runPrompt`). */
+  interrupt?: () => Promise<void>
+  /** Set when the user explicitly stopped the run (Slack Stop control or a stop message). */
+  userStopped: boolean
   /** Tool call ID → tool name, so later tool events can be titled. */
   toolNames: Map<string, string>
   /**

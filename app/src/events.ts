@@ -186,7 +186,10 @@ export async function startEventLoop(
       // failure we always post an explanation, even if partial text was already
       // published, so errors are never silent.
       let outcomeText: string | null = null
-      if (failed) {
+      if (session.userStopped) {
+        // A user-requested stop is not a failure, whichever terminal event wins.
+        outcomeText = "Stopped at your request."
+      } else if (failed) {
         const detail = session.lastError.trim()
         outcomeText = detail
           ? `:warning: Sorry, I couldn't complete that request: ${detail}`
@@ -468,7 +471,7 @@ export async function startEventLoop(
         if (!match) break
         const [key, session] = match
         console.log(`[session] execution interrupted for ${sessionID} (${reason})`)
-        if (!session.lastError) session.lastError = `the run was interrupted (${reason})`
+        if (!session.lastError && !session.userStopped) session.lastError = `the run was interrupted (${reason})`
         await finalizeSession(key, session, true)
         break
       }

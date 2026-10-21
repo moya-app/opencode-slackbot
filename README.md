@@ -101,6 +101,7 @@ Optional scopes for DM support:
 3. Expand **"Subscribe to bot events"**
 4. Click **"Add Bot User Event"** and add:
    - `app_mention` - When users @mention your bot
+   - `agent_session_stopped` - When a user presses Slack's native stop button while the bot is working
    - `message.channels` - Messages in public channels
    - `messages.im` - Messages in direct messages
 

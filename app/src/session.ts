@@ -41,6 +41,7 @@ export class SessionStore {
       thread,
       isChannel,
       streamer: null,
+      userStopped: false,
       toolNames: new Map(),
       textByMessage: new Map(),
       messageFinishByID: new Map(),
@@ -112,5 +113,6 @@ export class SessionStore {
     session.lastError = ""
     // streamer is nulled by the event loop after stopping; reset here defensively
     session.streamer = null
+    session.userStopped = false
   }
 }

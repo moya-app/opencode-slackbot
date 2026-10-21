@@ -10,7 +10,7 @@ import { chdir } from "node:process"
 import { DATA_DIR } from "./types"
 import { STAGING_ROOT, stagingDirFor } from "./paths"
 import type { PromptInput, SlackClient } from "./types"
-import type { IncomingAttachment } from "./types"
+import type { IncomingAttachment, SessionState } from "./types"
 import { SessionStore } from "./session"
 import { startEventLoop } from "./events"
 import { safeStreamAction, postAssistantResponse } from "./slack"
@@ -506,6 +506,21 @@ async function runPrompt(input: PromptInput): Promise<void> {
   }
 }
 
+/**
+ * Interrupt the OpenCode run backing a session. Also marks the session so the
+ * resulting `session.execution.interrupted` is reported as "Stopped at your
+ * request." rather than as an error.
+ */
+async function interruptSession(session: SessionState): Promise<void> {
+  session.userStopped = true
+  try {
+    await opencode.session.interrupt({ sessionID: session.sessionId })
+    console.log(`[run] interrupted session ${session.sessionId} at the user's request`)
+  } catch (error) {
+    console.error(`Failed to interrupt session ${session.sessionId}:`, error)
+  }
+}
+
 async function runPromptInner(input: PromptInput, state: { run?: RunLink }): Promise<void> {
   const { client, channel, threadTs, text, files, attachments, isChannel, recipientTeamId, recipientUserId, setStatus, onError } = input
   const tableTexts = extractTablesFromAttachments(attachments)
@@ -572,6 +587,10 @@ async function runPromptInner(input: PromptInput, state: { run?: RunLink }): Pro
   }
 
   const session = existingSession
+
+  // Lets `safeStreamAction` interrupt the run when the user presses Slack's
+  // Stop control on the streaming message.
+  session.interrupt = () => interruptSession(session)
 
   // Restrict this session to its own scratch directory before it runs.
   await ensureSessionPermissions(session.sessionId)
@@ -777,6 +796,40 @@ app.event("app_mention", async ({ event, client, context }) => {
       await client.chat.postMessage({ channel, thread_ts, text: errorMessage })
     },
   })
+})
+
+// ─── Native "stop" control on agent sessions ─────────────────────
+
+type AgentSessionStoppedEvent = {
+  type: "agent_session_stopped"
+  channel: string
+  thread_ts?: string
+  user?: string
+  /** Streams Slack stopped in response to the click (empty if none were active). */
+  streaming_message_ts?: string[]
+}
+
+/**
+ * Slack shows a native stop control while an agent session is processing and
+ * fires this event when the user presses it. Interrupt the OpenCode run so
+ * pressing stop actually stops the work, not just the streamed message.
+ */
+app.event("agent_session_stopped", async ({ event, context }) => {
+  const stopped = event as unknown as AgentSessionStoppedEvent
+  const { channel, thread_ts, user } = stopped
+  console.log(`agent_session_stopped in ${channel} (thread ${thread_ts ?? "none"}) by ${user ?? "unknown"}`)
+
+  if (isUnauthorized(user, (context as { teamId?: string }).teamId)) return
+  if (!thread_ts) return
+
+  const session = store.get(`${channel}-${thread_ts}`)
+  if (!session) {
+    console.log(`agent_session_stopped: no session for thread ${channel}-${thread_ts}`)
+    return
+  }
+
+  // Slack has already stopped the streaming message(s); this stops the agent.
+  await interruptSession(session)
 })
 
 // ─── Direct messages + channel thread replies ─────────────────────
