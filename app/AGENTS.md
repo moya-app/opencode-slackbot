@@ -21,7 +21,8 @@ streams tool/task updates and final responses back into Slack threads.
     `buildSessionInstructions` builds the text.
   - Creates the `SessionStore` and starts the global event loop.
   - Implements `runPrompt` (shared logic for all surfaces) and registers Slack event handlers: Assistant `userMessage`,
-    `app_mention`, `message` (DMs), and the `feedback` button action.
+    `app_mention`, `message` (DMs and channel thread replies, including `thread_broadcast` replies where the user ticked
+    "Also send to channel"), and the `feedback` button action.
 
 - `src/types.ts`
   - All shared types: `SessionUsage`, `SessionState`, `ActiveRunState`, `PromptInput`, `SlackClient`.
@@ -76,7 +77,9 @@ streams tool/task updates and final responses back into Slack threads.
 
 - `src/events.ts`
   - `startEventLoop`: subscribes to the OpenCode V2 event stream and processes events in batched 1 s flush windows
-    (chosen to stay under Slack's `chat.appendStream` Tier 4 rate limit).
+    (chosen to stay under Slack's `chat.appendStream` Tier 4 rate limit). The subscription is wrapped in
+    `subscribeWithReconnect`, which resubscribes if the stream ends or throws — otherwise a dropped stream would stop
+    all run finalisation and leave every thread silent until the process restarts.
   - Handles the V2 events: `session.text.started/delta/ended`, `session.reasoning.started/delta`,
     `session.step.started/ended/failed`, `session.tool.input.started`, `session.tool.called/success/failed`,
     `session.usage.updated`, `session.execution.succeeded/failed/interrupted`, and `session.idle`.
@@ -153,7 +156,9 @@ Each thread session (`SessionState`) tracks:
 - The event loop batches chunks over 1 s windows — keep flush logic inside `flushEntry` in `src/events.ts`. A
   `rate_limited` result re-queues the chunks for the next flush; any other failure drops them.
 - Runs are serialized per thread with `runQueue` in `src/index.ts`. `finalizeSession` resolves the run's `done` promise
-  (which releases the next queued prompt); keep that in sync when changing the run lifecycle.
+  (which releases the next queued prompt); keep that in sync when changing the run lifecycle. A run that shows no
+  activity for `RUN_STALE_MS` (no OpenCode events, no pre-prompt progress) is released by
+  `waitForPreviousRun` so one lost terminal event cannot silence a thread forever.
 - Uploaded files live in a per-session directory under `/tmp/opencode-slack/<session>/` and are read by the agent by
   path. That same directory is the agent's only writable scratch space: `runPrompt` creates it and announces its path
   once per session through a session-scoped instruction entry (`ensureSessionInstructions`, key `slack.session`), so

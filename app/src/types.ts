@@ -49,6 +49,8 @@ export type ActiveRunState = {
   /** Resolves when the run has finalized — used to serialize runs per thread. */
   done: Promise<void>
   resolveDone: () => void
+  /** Last time an OpenCode event for this run arrived; used to detect dead runs. */
+  lastActivityAt: number
 }
 
 export type IncomingAttachment = {

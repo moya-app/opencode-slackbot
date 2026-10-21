@@ -36,6 +36,9 @@ function formatSessionError(error: unknown): string {
   return bits.join(" ")
 }
 
+/** How long to wait before resubscribing after the event stream drops. */
+const EVENT_RECONNECT_DELAY_MS = 5_000
+
 export async function startEventLoop(
   opencode: EventSource,
   client: SlackClient,
@@ -43,6 +46,26 @@ export async function startEventLoop(
 ): Promise<void> {
   const pending = new Map<string, PendingEntry>()
   let flushTimer: ReturnType<typeof setTimeout> | null = null
+
+  /**
+   * The event subscription is a single long-lived stream: if it throws (service
+   * restart, dropped socket) the loop would exit and no terminal event would
+   * ever arrive again, leaving every run stuck and every thread silent. Keep
+   * resubscribing instead.
+   */
+  async function* subscribeWithReconnect(): AsyncGenerator<OpenCodeEvent> {
+    for (;;) {
+      try {
+        for await (const event of opencode.event.subscribe()) {
+          yield event
+        }
+        console.error("[events] OpenCode event stream ended; resubscribing")
+      } catch (error) {
+        console.error("[events] OpenCode event stream failed; resubscribing:", error)
+      }
+      await new Promise((resolve) => setTimeout(resolve, EVENT_RECONNECT_DELAY_MS))
+    }
+  }
 
   async function flushEntry(key: string, entry: PendingEntry) {
     const { session, chunks, thinkingUpdates } = entry
@@ -227,7 +250,16 @@ export async function startEventLoop(
     }
   }
 
-  for await (const event of opencode.event.subscribe()) {
+  for await (const event of subscribeWithReconnect()) {
+    // Any event for a session proves its run is still alive; the per-thread
+    // watchdog in runPrompt uses this to tell a slow run from a dead one.
+    const sessionID = (event.data as { sessionID?: string } | undefined)?.sessionID
+    if (sessionID) {
+      const match = store.findBySessionId(sessionID)
+      const run = match ? store.activeRuns.get(match[0]) : undefined
+      if (run) run.lastActivityAt = Date.now()
+    }
+
     switch (event.type) {
       // ── Text output ──────────────────────────────────────────────
       case "session.text.started": {

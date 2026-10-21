@@ -163,8 +163,73 @@ startEventLoop(opencode, app.client, store)
  * Per-thread run queue. Each prompt appends a link to its thread's chain and
  * waits for the previous one, so terminal OpenCode events from an older run can
  * never be mistaken for the current one.
+ *
+ * The link also carries a `release` used by the watchdog: a run is normally
+ * finalized by the OpenCode event loop, but if a terminal event is lost the
+ * chain would never settle and every later message in that thread would be
+ * silently ignored (no working task, no reply).
  */
-const runQueue = new Map<string, Promise<void>>()
+type RunLink = {
+  link: Promise<void>
+  release: () => void
+  /** Last sign of life, including the pre-prompt phase before the run is active. */
+  lastActivityAt: number
+}
+
+const runQueue = new Map<string, RunLink>()
+
+/** How often the watchdog re-checks a run the thread is waiting on. */
+const RUN_WATCHDOG_POLL_MS = 15_000
+/**
+ * A run with no sign of life for this long is treated as dead and released.
+ * Deliberately generous: a single long tool call can go quiet for a while, and
+ * abandoning a live run would run two prompts against one OpenCode session.
+ */
+const RUN_STALE_MS = 10 * 60_000
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+/**
+ * Wait for the previous run in this thread to finish, reaping it if it has gone
+ * completely quiet. Without this, one lost terminal event (OpenCode restart,
+ * dropped event stream, aborted run) would block the thread forever.
+ */
+async function waitForPreviousRun(client: SlackClient, key: string, prior: RunLink | undefined): Promise<void> {
+  if (!prior) return
+
+  let settled = false
+  const priorSettled = prior.link.then(() => { settled = true }, () => { settled = true })
+
+  while (!settled) {
+    await Promise.race([priorSettled, sleep(RUN_WATCHDOG_POLL_MS)])
+    if (settled) return
+
+    const run = store.activeRuns.get(key)
+    // Whichever is newer: the run's own event activity, or the pre-prompt
+    // heartbeat its invocation updated while staging the request.
+    const lastAlive = Math.max(prior.lastActivityAt, run?.lastActivityAt ?? 0)
+    const idleMs = Date.now() - lastAlive
+    if (idleMs < RUN_STALE_MS) continue
+
+    console.error(`[run] releasing stalled run in ${key}: no activity for ${Math.round(idleMs / 1000)}s`)
+    const stalled = store.get(key)
+    if (stalled?.streamer) {
+      await safeStreamAction(client, stalled, () => stalled.streamer!.stop({
+        chunks: [{
+          type: "markdown_text",
+          text: ":warning: This request stopped responding, so I abandoned it. Please try again.",
+        } as AnyChunk],
+      }))
+      stalled.streamer = null
+    }
+    store.activeRuns.delete(key)
+    if (stalled) store.resetRunState(stalled)
+    prior.release()
+    return
+  }
+}
 
 function sanitizeFileName(name: string): string {
   const base = basename(name)
@@ -415,6 +480,33 @@ async function stageAttachments(
 }
 
 async function runPrompt(input: PromptInput): Promise<void> {
+  // Set by runPromptInner once it has queued this run; used to release the
+  // thread's run chain if the prompt fails unexpectedly.
+  const state: { run?: RunLink } = {}
+  try {
+    await runPromptInner(input, state)
+  } catch (error) {
+    // A throw anywhere after the run was queued would otherwise leave the
+    // thread's run chain unresolved, so every later message in this thread
+    // would wait forever and post nothing.
+    console.error(`[run] unexpected prompt failure for ${input.channel}-${input.threadTs}:`, error)
+    const link = state.run
+    if (link) {
+      const key = `${input.channel}-${input.threadTs}`
+      const active = store.activeRuns.get(key)
+      if (active?.resolveDone === link.release) {
+        const session = store.get(key)
+        store.activeRuns.delete(key)
+        if (session) store.resetRunState(session)
+      }
+      link.release()
+    }
+    await input.onError(":warning: Sorry, something went wrong while starting that request. Please try again.")
+      .catch((e) => console.error("Failed to report prompt failure to Slack:", e))
+  }
+}
+
+async function runPromptInner(input: PromptInput, state: { run?: RunLink }): Promise<void> {
   const { client, channel, threadTs, text, files, attachments, isChannel, recipientTeamId, recipientUserId, setStatus, onError } = input
   const tableTexts = extractTablesFromAttachments(attachments)
   if (!text && !files?.length && !tableTexts.length) return
@@ -441,17 +533,21 @@ async function runPrompt(input: PromptInput): Promise<void> {
   // session, so two prompts in the same thread would clobber each other's
   // streamer/state (the older run's terminal event would finalize the newer
   // run). Chain runs per thread so each prompt waits for the previous one.
-  const priorLink = runQueue.get(sessionKey) ?? Promise.resolve()
+  const priorLink = runQueue.get(sessionKey)
   let resolveDone!: () => void
   const done = new Promise<void>((resolve) => { resolveDone = resolve })
-  const link = priorLink.then(() => done)
-  runQueue.set(sessionKey, link)
+  const link = (priorLink?.link ?? Promise.resolve()).then(() => done)
+  const self: RunLink = { link, release: resolveDone, lastActivityAt: Date.now() }
+  state.run = self
+  const noteActivity = () => { self.lastActivityAt = Date.now() }
+  runQueue.set(sessionKey, self)
   // Drop the queue entry once this link settles and no newer prompt is waiting,
   // so the map does not grow with every thread the bot has ever seen.
   void link.finally(() => {
-    if (runQueue.get(sessionKey) === link) runQueue.delete(sessionKey)
+    if (runQueue.get(sessionKey) === self) runQueue.delete(sessionKey)
   })
-  await priorLink
+  await waitForPreviousRun(client, sessionKey, priorLink)
+  noteActivity()
 
   let existingSession = store.get(sessionKey)
   if (!existingSession) {
@@ -479,6 +575,7 @@ async function runPrompt(input: PromptInput): Promise<void> {
 
   // Restrict this session to its own scratch directory before it runs.
   await ensureSessionPermissions(session.sessionId)
+  noteActivity()
   const stagedDir = stagingDirFor(session.sessionId)
 
   // Create the scratch directory even when there are no uploads, so the agent
@@ -493,6 +590,7 @@ async function runPrompt(input: PromptInput): Promise<void> {
   // instructions, so it is part of the system prompt rather than repeated on
   // every message round.
   await ensureSessionInstructions(session.sessionId, stagedDir)
+  noteActivity()
 
   // Reset per-run state (this also clears any stale lastError). Session-level
   // usage/model are intentionally preserved.
@@ -515,9 +613,11 @@ async function runPrompt(input: PromptInput): Promise<void> {
 
   // Register the run before staging so the next prompt has something to await
   // and finalizeSession can release the slot.
-  store.activeRuns.set(sessionKey, { workingTaskId, resolveDone, done })
+  store.activeRuns.set(sessionKey, { workingTaskId, resolveDone, done, lastActivityAt: Date.now() })
+  noteActivity()
 
   const stagedFiles = await stageAttachments(files, client, stagedDir)
+  noteActivity()
   if (files?.length && stagedFiles.length === 0) {
     console.warn("stageAttachments: all files failed to stage")
   }
@@ -688,9 +788,12 @@ app.event("message", async ({ event, client, context }) => {
   if (message.bot_id) return
 
   // file_share subtype is how Slack delivers DM file uploads — allow it through.
-  // All other subtypes (message_changed, message_deleted, etc.) are skipped.
+  // thread_broadcast is a normal thread reply where the user ticked "Also send
+  // to channel", which must still be handled as a follow-up. All other subtypes
+  // (message_changed, message_deleted, etc.) are skipped.
   const isFileShare = message.subtype === "file_share"
-  if (message.subtype && !isFileShare) {
+  const isThreadBroadcast = message.subtype === "thread_broadcast"
+  if (message.subtype && !isFileShare && !isThreadBroadcast) {
     console.log(`message event skipped: subtype="${message.subtype}"`)
     return
   }
@@ -719,7 +822,12 @@ app.event("message", async ({ event, client, context }) => {
   // For channel messages, only respond if the bot already has a session for
   // this thread (i.e. it was previously @mentioned here). This avoids the
   // bot responding to every message in every channel it is a member of.
-  if (!isDM && !store.get(`${channel}-${threadTs}`)) return
+  if (!isDM && !store.get(`${channel}-${threadTs}`)) {
+    console.log(`channel message ignored: no session for thread ${channel}-${threadTs}`)
+    return
+  }
+
+  console.log(`${isDM ? "direct_message" : "channel_thread_reply"} in ${channel} (thread ${threadTs}): "${text}"`)
 
   await runPrompt({
     client,
